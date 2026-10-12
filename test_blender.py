@@ -11,6 +11,8 @@ executable is not needed.
 """
 import importlib.util
 import json
+import subprocess
+import math
 import sys
 import tempfile
 import unittest
@@ -24,8 +26,9 @@ import blender as B  # noqa: E402
 HAS_BPY = importlib.util.find_spec("bpy") is not None
 
 
-def model_for(code, size=2.0, segments=8):
-    model, _ = B.build_model(code, code, ROOT / "data" / "svg" / f"{code}.svg", size, segments)
+def model_for(code, size=2.0, segments=8, skin="none"):
+    """`skin="none"` by default: most tests are about the Twemoji shapes, not the generated head."""
+    model, _ = B.build_model(code, code, ROOT / "data" / "svg" / f"{code}.svg", size, segments, skin=skin)
     return model
 
 
@@ -145,27 +148,417 @@ class FaceDetection(unittest.TestCase):
         self.assertFalse(model_for("1f680")["facemap"]["complete"])
 
 
-class Layers(unittest.TestCase):
-    def test_paint_order_survives_layer_split(self):
+def node(model, part):
+    return next(n for n in model["nodes"] if n["part"] == part)
+
+
+def world(model, n):
+    """World position of a node by walking its parents."""
+    by_name = {x["name"]: x for x in model["nodes"]}
+    pos = [0.0, 0.0, 0.0]
+    while n:
+        pos = [a + b for a, b in zip(pos, n["location"])]
+        n = by_name.get(n["parent"])
+    return pos
+
+
+class Rig(unittest.TestCase):
+    def test_hierarchy(self):
+        m = model_for("1f633")
+        name = m["name"]
+        self.assertEqual(node(m, "root")["parent"], None)
+        self.assertEqual(node(m, "eyes")["parent"], name)
+        self.assertEqual(node(m, "eye_left")["parent"], f"{name}.eyes")
+        self.assertEqual(node(m, "pupil_left")["parent"], f"{name}.eye_left")   # pupils follow their eye
+        self.assertEqual(node(m, "brow_right")["parent"], f"{name}.brows")
+        self.assertEqual(node(m, "blush_left")["parent"], f"{name}.face")
+        m = model_for("1f602")
+        self.assertEqual(node(m, "teeth")["parent"], "1f602.mouth")             # teeth follow the jaw
+        self.assertEqual(node(m, "tear_left")["parent"], "1f602.tears")
+
+    def test_parents_come_before_children(self):
+        names = []
+        for n in model_for("1f633")["nodes"]:
+            self.assertTrue(n["parent"] is None or n["parent"] in names, n["name"])
+            names.append(n["name"])
+
+    def test_local_locations_add_up_to_world(self):
+        m = model_for("1f633")
+        for n in m["nodes"]:
+            for a, b in zip(world(m, n), n["world"]):
+                self.assertAlmostEqual(a, b, places=9, msg=n["name"])
+
+    def test_stroke_points_are_relative_to_the_pivot(self):
+        m = model_for("1f600")
+        eye = node(m, "eye_left")        # pivot "center": the points straddle the origin
+        xs = [p[0] for s in eye["strokes"] for p in s["points"]]
+        zs = [p[2] for s in eye["strokes"] for p in s["points"]]
+        self.assertAlmostEqual((min(xs) + max(xs)) / 2, 0, places=6)
+        self.assertAlmostEqual((min(zs) + max(zs)) / 2, 0, places=6)
+
+    def test_default_pivots(self):
+        m = model_for("1f602")
+        fm = m["facemap"]["parts"]
+        self.assertAlmostEqual(fm["mouth"]["pivot"][1], fm["mouth"]["bbox"][3])            # "top"
+        self.assertGreater(fm["brow_left"]["pivot"][0], fm["brow_left"]["center"][0])      # "inner" (towards x=0)
+        self.assertLess(fm["brow_right"]["pivot"][0], fm["brow_right"]["center"][0])
+
+    def test_depth_follows_paint_order(self):
+        # Separate objects have no layer order, so later shapes sit nearer the camera (smaller Y).
+        m = model_for("1f602")
+        y = {n["part"]: n["world"][1] for n in m["nodes"] if n["kind"] == "gp"}
+        self.assertLess(y["mouth"], y["face"])
+        self.assertLess(y["teeth"], y["mouth"])        # teeth are painted over the mouth
+        self.assertLess(y["tear_left"], y["face"])
+
+    def test_paint_order_survives_the_split(self):
         # 🤔: the hand is drawn after (on top of) the mouth.
         m = model_for("1f914")
-        names = [l["name"] for l in m["layers"]]
-        self.assertLess(names.index("mouth"), names.index("other_02"))
+        y = {n["part"]: n["world"][1] for n in m["nodes"] if n["kind"] == "gp"}
+        self.assertLess(y["other_02"], y["mouth"])
         self.assertEqual(m["facemap"]["warnings"], [])
-
-    def test_layer_origin_is_part_centre(self):
-        m = model_for("1f602")
-        for layer in m["layers"]:
-            xs = [p[0] for s in layer["strokes"] for p in s["points"]]
-            zs = [p[2] for s in layer["strokes"] for p in s["points"]]
-            self.assertAlmostEqual((min(xs) + max(xs)) / 2, 0, places=6)
-            self.assertAlmostEqual((min(zs) + max(zs)) / 2, 0, places=6)
 
     def test_size_is_respected(self):
         m = model_for("1f600", size=4.0)
-        face = m["layers"][0]
-        xs = [p[0] for p in face["strokes"][0]["points"]]
-        self.assertAlmostEqual(max(xs) - min(xs), 4.0, places=2)
+        x0, _, x1, _ = node(m, "face")["bbox"]
+        self.assertAlmostEqual(x1 - x0, 4.0, places=2)
+
+
+class Registry(unittest.TestCase):
+    def test_every_spec_builds_cleanly(self):
+        for code, spec in B.FACES.items():
+            m = model_for(code)
+            fm = m["facemap"]
+            self.assertEqual(fm["warnings"], [], code)
+            self.assertTrue(fm["supported"] and fm["is_face"] and fm["complete"], code)
+            self.assertEqual([c["name"] for c in m["clips"]], list(spec.animations), code)   # none skipped
+
+    def test_every_animation_name_exists(self):
+        for code, spec in B.FACES.items():
+            for a in spec.animations:
+                self.assertIn(a, B.CLIPS, code)
+
+    def test_rule_relabels_a_shape(self):
+        m = model_for("1f62d")      # the pool of tears is its own object
+        self.assertIn("tear_pool", m["facemap"]["parts"])
+        self.assertEqual(node(m, "tear_pool")["parent"], "1f62d")
+
+    def test_rule_that_matches_nothing_warns(self):
+        spec = B.FaceSpec("t", ("talk",), rules=(B.Rule("nose", near=(1, 1), radius=0.5),))
+        m, _ = B.build_model("1f600", "1f600", ROOT / "data/svg/1f600.svg", 2.0, 8, spec)
+        self.assertTrue(any("nose" in w for w in m["facemap"]["warnings"]))
+
+    def test_pivot_override_in_svg_units(self):
+        base = model_for("1f600")["facemap"]["parts"]["eye_left"]["pivot"]
+        spec = B.FaceSpec("t", ("blink",), pivots={"eye_left": (0, 5)})       # 5 SVG units down
+        m, _ = B.build_model("1f600", "1f600", ROOT / "data/svg/1f600.svg", 2.0, 8, spec)
+        piv = m["facemap"]["parts"]["eye_left"]["pivot"]
+        self.assertAlmostEqual(piv[1], model_for("1f600")["facemap"]["parts"]["eye_left"]["center"][1] - 5 * 2.0 / 36)
+        self.assertAlmostEqual(piv[0], base[0])
+
+    def test_unknown_animation_warns(self):
+        spec = B.FaceSpec("t", ("blink", "moonwalk"))
+        m, _ = B.build_model("1f600", "1f600", ROOT / "data/svg/1f600.svg", 2.0, 8, spec)
+        self.assertTrue(any("moonwalk" in w for w in m["facemap"]["warnings"]))
+        self.assertEqual([c["name"] for c in m["clips"]], ["blink"])
+
+    def test_clip_needing_missing_parts_is_skipped_with_a_warning(self):
+        spec = B.FaceSpec("t", ("brow_raise", "blink"))      # 1f600 has no brows
+        m, _ = B.build_model("1f600", "1f600", ROOT / "data/svg/1f600.svg", 2.0, 8, spec)
+        self.assertEqual([c["name"] for c in m["clips"]], ["blink"])
+        self.assertTrue(any("brow_raise" in w for w in m["facemap"]["warnings"]))
+
+    def test_unlisted_emoji_get_a_generic_spec(self):
+        m = model_for("1f60e")      # sunglasses: not in FACES
+        self.assertFalse(m["facemap"]["supported"])
+
+
+class Clips(unittest.TestCase):
+    def test_every_clip_returns_to_rest_and_is_ordered(self):
+        for code in B.FACES:
+            m = model_for(code)
+            last_end = 0
+            for c in m["clips"]:
+                self.assertGreaterEqual(c["start"], last_end, code)      # clips never overlap
+                last_end = c["end"]
+                for t in c["tracks"]:
+                    frames = [k[0] for k in t["keys"]]
+                    self.assertEqual(frames, sorted(frames))
+                    self.assertEqual(frames[0], c["start"])
+                    self.assertEqual(frames[-1], c["end"])
+                    self.assertAlmostEqual(t["keys"][0][1], t["keys"][-1][1], msg=f"{code} {c['name']}")
+
+    def test_every_clip_actually_moves_something(self):
+        for code in B.FACES:
+            for c in model_for(code)["clips"]:
+                self.assertTrue(any(len({round(k[1], 6) for k in t["keys"]}) > 1 for t in c["tracks"]),
+                                f"{code} {c['name']}")
+
+    def test_blink_only_targets_the_listed_eyes(self):
+        m = model_for("1f609")      # winking: the right eye is already the wink
+        blink = next(c for c in m["clips"] if c["name"] == "blink")
+        self.assertEqual({t["node"] for t in blink["tracks"]}, {"1f609.eye_left"})
+
+    def test_talk_keeps_the_jaw_inside_the_face(self):
+        m = model_for("1f600")
+        mouth, talk = node(m, "mouth"), next(c for c in m["clips"] if c["name"] == "talk")
+        peak = max(k[1] for t in talk["tracks"] if t["index"] == 2 for k in t["keys"])
+        pz, z0 = mouth["world"][2], mouth["bbox"][1]
+        self.assertGreaterEqual(pz - (pz - z0) * peak, -0.97 * m["size"] / 2 - 1e-9)
+
+    def test_location_keys_are_offsets_from_the_rest_position(self):
+        m = model_for("1f602")
+        raise_clip = next(c for c in m["clips"] if c["name"] == "brow_raise")
+        t = raise_clip["tracks"][0]
+        rest = node(m, "brows")["location"][2]
+        self.assertAlmostEqual(t["keys"][0][1], rest)
+        self.assertGreater(max(k[1] for k in t["keys"]), rest)
+
+
+class ZombieSkin(unittest.TestCase):
+    def test_twemoji_head_disc_is_gone_and_replaced_by_layers(self):
+        for code, spec in B.FACES.items():
+            if not spec.zombie_head:
+                continue
+            m = model_for(code, skin="zombie")
+            face = next(n for n in m["nodes"] if n["part"] == "face")
+            self.assertEqual(face["kind"], "empty", code)           # no disc any more
+            self.assertNotIn("face", m["facemap"]["parts"], code)
+            layers = [n for n in m["nodes"] if n.get("skin")]
+            self.assertEqual([n["part"] for n in layers], list(B.ZOMBIE_LAYERS), code)
+            self.assertGreaterEqual(len(layers), 10)
+            colors = {st["color"] for n in m["nodes"] if n["kind"] == "gp" for st in n["strokes"]}
+            self.assertNotIn("#ffcc4d", colors, code)
+            self.assertEqual(m["facemap"]["warnings"], [], code)
+            self.assertEqual(m["facemap"]["skin"], "zombie")
+            self.assertEqual(m["facemap"]["groups"]["head"], list(B.ZOMBIE_LAYERS))
+
+    def test_skull_is_not_given_a_zombie_head(self):
+        m = model_for("2620", skin="zombie")
+        self.assertFalse([n for n in m["nodes"] if n.get("skin")])
+        self.assertEqual(next(n for n in m["nodes"] if n["part"] == "face")["kind"], "gp")
+        self.assertEqual(m["facemap"]["skin"], "none")
+
+    def test_glasses_lenses_are_flesh_not_yellow(self):
+        m = model_for("1f913", skin="zombie")
+        holes = [st for n in m["nodes"] if n["kind"] == "gp" for st in n["strokes"] if st["hole"]]
+        self.assertTrue(holes)
+        self.assertTrue(all(st["color"] == B.ZOMBIE_LAYERS["flesh_base"][0] for st in holes))
+
+    def test_head_is_not_a_circle(self):
+        m = model_for("1f600", skin="zombie")
+        base = next(n for n in m["nodes"] if n["part"] == "flesh_base")
+        radii = [math.hypot(x + base["world"][0], z + base["world"][2]) for x, _, z in base["strokes"][0]["points"]]
+        self.assertGreater(max(radii) - min(radii), 0.05)
+        self.assertGreater(min(radii), 0.8)           # still covers where the features sit
+        self.assertLess(max(radii), 1.05)
+
+    def test_red_head_is_tinted_not_kept(self):
+        red = model_for("1f621", skin="zombie")
+        yellow = model_for("1f600", skin="zombie")
+        col = lambda m: next(n for n in m["nodes"] if n["part"] == "flesh_base")["strokes"][0]["color"]
+        self.assertNotEqual(col(red), col(yellow))
+        self.assertGreater(B.hex_rgb(col(red))[0], B.hex_rgb(col(yellow))[0])   # redder
+
+    def test_skin_none_keeps_the_original_disc(self):
+        m = model_for("1f600", skin="none")
+        face = next(n for n in m["nodes"] if n["part"] == "face")
+        self.assertEqual(face["kind"], "gp")
+        self.assertEqual({s["color"] for s in face["strokes"]}, {"#ffcc4d"})
+        self.assertFalse([n for n in m["nodes"] if n.get("skin")])
+        self.assertEqual(m["facemap"]["skin"], "none")
+
+    def test_layers_are_children_of_face_inside_head_in_paint_order_behind_features(self):
+        m = model_for("1f602", skin="zombie")
+        by = {n["name"]: n for n in m["nodes"]}
+        layers = [n for n in m["nodes"] if n.get("skin")]
+        rim = layers[0]
+        limit = max(math.hypot(x + rim["world"][0], z + rim["world"][2]) for x, _, z in rim["strokes"][0]["points"])
+        ys = [n["world"][1] for n in layers]
+        self.assertEqual(ys, sorted(ys, reverse=True))               # later layers are nearer the camera
+        self.assertGreater(min(ys), by["1f602.eye_left"]["world"][1])  # but every one is behind the features
+        self.assertGreater(min(ys), by["1f602.mouth"]["world"][1])
+        for n in layers:
+            self.assertEqual(n["parent"], "1f602.face")
+            for st in n["strokes"]:
+                for x, _, z in st["points"]:
+                    self.assertLessEqual(math.hypot(x + n["world"][0], z + n["world"][2]), limit + 1e-9, n["part"])
+
+    def test_deterministic_and_different_per_emoji(self):
+        a = B.zombie_head_layers("1f600", 1.0)
+        self.assertEqual(a, B.zombie_head_layers("1f600", 1.0))
+        self.assertNotEqual(a["flesh_mottle"], B.zombie_head_layers("1f602", 1.0)["flesh_mottle"])
+        self.assertNotEqual(a["flesh_base"], B.zombie_head_layers("1f602", 1.0)["flesh_base"])
+
+
+class NewFaces(unittest.TestCase):
+    def test_nerd_glasses_are_painted_behind_the_eyes_they_frame(self):
+        m = model_for("1f913")
+        y = {n["part"]: n["world"][1] for n in m["nodes"]}
+        self.assertGreater(y["glasses"], y["eye_left"])          # larger Y = further from the camera
+        self.assertGreater(y["glasses"], y["eye_right"])
+        self.assertEqual(m["facemap"]["warnings"], [])
+
+    def test_pleading_face_gets_brows_and_eye_whites_under_the_eyes(self):
+        m = model_for("1f97a")
+        self.assertEqual(node(m, "brow_left")["parent"], "1f97a.brows")
+        self.assertEqual(node(m, "eyewhite_left")["parent"], "1f97a.eye_left")
+        self.assertEqual(node(m, "highlight_left")["parent"], "1f97a.eye_left")
+
+    def test_exploding_head_groups_smoke_and_flames(self):
+        m = model_for("1f92f")
+        self.assertEqual(node(m, "explosion")["kind"], "empty")
+        for part in ("smoke", "flame_outer", "flame_mid", "flame_inner", "smoke_light_left"):
+            self.assertEqual(node(m, part)["parent"], "1f92f.explosion", part)
+
+    def test_zany_tongue_and_mask_and_skull_parts(self):
+        self.assertEqual(node(model_for("1f92a"), "tongue_detail")["parent"], "1f92a.tongue")
+        self.assertEqual(node(model_for("1f92a"), "tongue")["parent"], "1f92a.mouth")
+        self.assertIn("mask", model_for("1f637")["facemap"]["parts"])
+        parts = model_for("2620")["facemap"]["parts"]
+        self.assertEqual({p for p in parts if p.startswith("bone_")},
+                         {"bone_top_left", "bone_top_right", "bone_bottom_left", "bone_bottom_right"})
+
+    def test_tear_well_grows_from_the_bottom(self):
+        m = model_for("1f979")
+        clip = next(c for c in m["clips"] if c["name"] == "tear_well")
+        w = B.evaluate_pose(m, (clip["start"] + clip["end"]) // 2)
+        self.assertGreater(w["1f979.tear_left"][3], 1.5)
+        self.assertGreaterEqual(node(m, "tear_left")["bbox"][1], -1)   # pivot at the bottom edge
+        self.assertAlmostEqual(node(m, "tear_left")["world"][2], node(m, "tear_left")["bbox"][1], places=6)
+
+    def test_rattle_and_shake_move_the_root(self):
+        for code, path in (("2620", "rotation_euler"), ("1f92f", "location")):
+            m = model_for(code)
+            name = "rattle" if code == "2620" else "shake"
+            clip = next(c for c in m["clips"] if c["name"] == name)
+            self.assertTrue(all(t["node"] == code and t["path"] == path for t in clip["tracks"]), code)
+
+    def test_complete_flag_accepts_a_mask_or_skull(self):
+        self.assertTrue(model_for("1f637")["facemap"]["complete"])
+        self.assertTrue(model_for("2620")["facemap"]["complete"])
+
+
+class IdleAnimation(unittest.TestCase):
+    def test_every_supported_face_has_the_idle_clips(self):
+        for code, spec in B.FACES.items():
+            for a in B.IDLE_CLIPS:
+                self.assertIn(a, spec.animations, code)
+
+    def test_look_around_looks_both_ways_features_lead_the_skull(self):
+        m = model_for("1f644", skin="zombie")
+        clip = next(c for c in m["clips"] if c["name"] == "look_around")
+        xs = lambda name: [B.evaluate_pose(m, clip["start"] + o)[name][4] for o in range(0, 73)]
+        rest = B.evaluate_pose(m, 1)
+        dx = lambda name: [v - rest[name][4] for v in xs(name)]
+        pupil, mouth, face = dx("1f644.pupil_left"), dx("1f644.mouth"), dx("1f644.face")
+        for series in (pupil, mouth, face):                      # left (negative X) and right (positive X)
+            self.assertLess(min(series), -1e-3)
+            self.assertGreater(max(series), 1e-3)
+        self.assertGreater(max(map(abs, mouth)), max(map(abs, face)) * 1.5)       # parallax
+        first_move = lambda s: next(i for i, v in enumerate(s) if abs(v) > 1e-4)
+        self.assertLess(first_move(pupil), first_move(face))                      # the eyes lead
+        w = B.evaluate_pose(m, clip["start"] + 30)
+        self.assertNotAlmostEqual(w["1f644.eyes"][1], 1.0)                        # the head is tilted (rotated)
+
+    def test_tilt_is_slight_and_returns(self):
+        m = model_for("1f600")
+        clip = next(c for c in m["clips"] if c["name"] == "tilt")
+        angles = [t["keys"] for t in clip["tracks"] if t["node"] == "1f600" and t["path"] == "rotation_euler"][0]
+        vals = [v for _, v in angles]
+        self.assertLessEqual(max(map(abs, vals)), 0.2)            # radians: well under 12 degrees
+        self.assertTrue(min(vals) < 0 < max(vals))
+        self.assertEqual(vals[0], 0.0)
+        self.assertEqual(vals[-1], 0.0)
+
+    def test_eye_dart_moves_the_pupils_only_a_little(self):
+        m = model_for("1f92a")
+        clip = next(c for c in m["clips"] if c["name"] == "eye_dart")
+        for t in clip["tracks"]:
+            rest = next(n for n in m["nodes"] if n["name"] == t["node"])["location"][t["index"]]
+            self.assertLess(max(abs(v - rest) for _, v in t["keys"]), 0.5)
+            self.assertTrue(t["node"].split(".")[1].startswith("pupil_"))
+
+
+class PosePreview(unittest.TestCase):
+    """The host-side pose evaluator behind --gif (pure Python, no Pillow needed)."""
+
+    def test_rest_pose_matches_the_rig(self):
+        m = model_for("1f602", skin="zombie")
+        w = B.evaluate_pose(m, 1)
+        by = {n["name"]: n for n in m["nodes"]}
+        for name, n in by.items():
+            parent = w[n["parent"]] if n["parent"] else None
+            px, py, pz = (parent[4], parent[5], parent[6]) if parent else (0, 0, 0)
+            self.assertAlmostEqual(w[name][4], px + n["location"][0], places=9, msg=name)
+            self.assertAlmostEqual(w[name][6], pz + n["location"][2], places=9, msg=name)
+            self.assertAlmostEqual(w[name][0], 1.0)
+            self.assertAlmostEqual(w[name][3], 1.0)
+
+    def test_blink_squashes_the_eye_and_the_pupil_follows(self):
+        m = model_for("1f600", skin="none")
+        clip = next(c for c in m["clips"] if c["name"] == "blink")
+        mid = (clip["start"] + clip["end"]) // 2
+        w = B.evaluate_pose(m, mid)
+        self.assertLess(w["1f600.eye_left"][3], 0.2)
+        self.assertLess(w["1f600.pupil_left"][3], 0.2) if "1f600.pupil_left" in w else None
+        self.assertAlmostEqual(B.evaluate_pose(m, clip["end"] + 2)["1f600.eye_left"][3], 1.0)
+
+    def test_every_face_is_back_at_rest_after_each_clip_and_at_the_end(self):
+        for code in B.FACES:
+            m = model_for(code, skin="zombie")
+            last = max(c["end"] for c in m["clips"])
+            rest, end = B.evaluate_pose(m, 1), B.evaluate_pose(m, last)
+            for name in rest:
+                for a, b in zip(rest[name], end[name]):
+                    self.assertAlmostEqual(a, b, places=6, msg=f"{code} {name}")
+
+    def test_rotation_about_the_view_axis(self):
+        m = {"nodes": [{"name": "r", "parent": None, "location": [0, 0, 0], "kind": "empty"},
+                       {"name": "c", "parent": "r", "location": [1, 0, 0], "kind": "empty"}],
+             "clips": [{"name": "x", "start": 1, "end": 2,
+                        "tracks": [{"node": "r", "path": "rotation_euler", "index": 1,
+                                    "keys": [[1, math.pi / 2], [2, math.pi / 2]]}]}]}
+        w = B.evaluate_pose(m, 1)
+        self.assertAlmostEqual(w["c"][4], 0.0, places=9)
+        self.assertAlmostEqual(w["c"][6], -1.0, places=9)    # Blender: +90 deg about Y sends +X to -Z
+
+
+@unittest.skipUnless(importlib.util.find_spec("PIL"), "needs Pillow")
+class GifExport(unittest.TestCase):
+    def test_gif_is_written_looping_with_the_whole_timeline(self):
+        from PIL import Image
+        m = model_for("1f602", skin="zombie")
+        with tempfile.TemporaryDirectory() as d:
+            n = B.write_gif(m, Path(d) / "x.gif", px=96)
+            self.assertEqual(n, max(c["end"] for c in m["clips"]))
+            g = Image.open(Path(d) / "x.gif")
+            self.assertEqual(g.size, (96, 96))
+            self.assertEqual(g.info.get("loop"), 0)
+            total = 0
+            for i in range(g.n_frames):          # identical frames are merged, their durations add up
+                g.seek(i)
+                total += g.info["duration"]
+            self.assertGreaterEqual(total, n * 30)
+
+    def test_frames_differ_during_a_clip_and_background_is_applied(self):
+        from PIL import ImageChops
+        m = model_for("1f600", skin="zombie")
+        clip = next(c for c in m["clips"] if c["name"] == "blink")
+        mid = (clip["start"] + clip["end"]) // 2
+        bg = B.hex_rgb("#102030")
+        a = B.render_frame(m, B.evaluate_pose(m, 1), 128, bg)
+        b = B.render_frame(m, B.evaluate_pose(m, mid), 128, bg)
+        self.assertEqual(a.getpixel((1, 1)), bg)
+        self.assertIsNotNone(ImageChops.difference(a, b).getbbox())
+        self.assertEqual(ImageChops.difference(a, B.render_frame(m, B.evaluate_pose(m, clip["end"] + 2), 128, bg)).getbbox(), None)
+
+    def test_cli_writes_gifs(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = subprocess.run([sys.executable, str(ROOT / "blender.py"), "--emojis", "1f600", "--facemap-only",
+                                "--gif", "--gif-size", "64", "--output", d], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue((Path(d) / "1f600.gif").read_bytes().startswith(b"GIF8"))
 
 
 class Cli(unittest.TestCase):
@@ -176,9 +569,32 @@ class Cli(unittest.TestCase):
         with self.assertRaises(SystemExit):
             B.resolve_codes("definitely_not_an_emoji", short)
 
-    def test_all_resolves_to_every_svg(self):
+    def test_faces_keyword_and_all(self):
         short, _ = B.load_emoji_tables()
-        self.assertEqual(len(B.resolve_codes("all", short)), len(list((ROOT / "data" / "svg").glob("*.svg"))))
+        self.assertEqual(B.resolve_codes("faces", short), list(B.FACES))
+        self.assertEqual(B.resolve_codes("all", short), list(B.FACES))     # no --experimental: supported faces only
+        self.assertEqual(len(B.resolve_codes("all", short, experimental=True)),
+                         len(list((ROOT / "data" / "svg").glob("*.svg"))))
+
+    def test_unsupported_emoji_are_refused_without_experimental(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(B.host_main(["--emojis", "1f60e", "--output", t, "--facemap-only"]), 1)
+            self.assertEqual(list(Path(t).glob("*.json")), [])
+
+    def test_experimental_exports_detected_faces_and_skips_non_faces(self):
+        with tempfile.TemporaryDirectory() as t:
+            rc = B.host_main(["--emojis", "1f60e,1f680,1f618", "--output", t, "--facemap-only", "--experimental"])
+            self.assertEqual(rc, 0)
+            self.assertTrue((Path(t) / "1f618.facemap.json").exists())
+            self.assertFalse((Path(t) / "1f680.facemap.json").exists())      # a rocket is not a face
+
+    def test_faces_keyword_writes_every_supported_face(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(B.host_main(["--emojis", "faces", "--output", t, "--facemap-only"]), 0)
+            self.assertEqual(len(list(Path(t).glob("*.facemap.json"))), len(B.FACES))
+
+    def test_list_faces(self):
+        self.assertEqual(B.host_main(["--list-faces"]), 0)
 
     def test_facemap_only_needs_no_blender(self):
         with tempfile.TemporaryDirectory() as t:
@@ -194,43 +610,90 @@ class BlenderSide(unittest.TestCase):
     def build(self, code):
         import bpy
         out = tempfile.mkdtemp() + f"/{code}.blend"
-        B._build_emoji_in_blender(bpy, model_for(code), out)
+        B._build_emoji_in_blender(bpy, model_for(code, skin="zombie"), out)
         bpy.ops.wm.read_factory_settings(use_empty=True)
         bpy.ops.wm.open_mainfile(filepath=out)
-        return bpy.data.objects[code]
+        bpy.context.view_layer.update()
+        return bpy
 
-    def test_layers_and_pivots(self):
-        obj = self.build("1f602")
-        layers = obj.data.layers
-        self.assertEqual([l.name for l in layers][0], "face")
-        self.assertLess(layers["eye_left"].translation[0], 0)
-        self.assertGreater(layers["eye_right"].translation[0], 0)
-        self.assertAlmostEqual(layers["eye_left"].translation[0], -layers["eye_right"].translation[0], places=4)
+    def test_one_object_per_part_with_parenting(self):
+        bpy = self.build("1f633")
+        ob = bpy.data.objects
+        self.assertEqual(ob["1f633.eye_left"].parent, ob["1f633.eyes"])
+        self.assertEqual(ob["1f633.pupil_left"].parent, ob["1f633.eye_left"])
+        self.assertEqual(ob["1f633.eyes"].parent, ob["1f633"])
+        self.assertEqual(ob["1f633"].type, "EMPTY")
+        self.assertEqual(ob["1f633.eye_left"].type, "GREASEPENCIL")
+        self.assertEqual(ob["1f633.eye_left"]["part"], "eye_left")
+
+    def test_world_positions_mirror_left_and_right(self):
+        bpy = self.build("1f602")
+        left, right = bpy.data.objects["1f602.eye_left"], bpy.data.objects["1f602.eye_right"]
+        self.assertLess(left.matrix_world.translation.x, 0)
+        self.assertAlmostEqual(left.matrix_world.translation.x, -right.matrix_world.translation.x, places=4)
+        self.assertAlmostEqual(left.matrix_world.translation.z, right.matrix_world.translation.z, places=4)
+
+    def test_depth_order(self):
+        bpy = self.build("1f602")
+        y = lambda n: bpy.data.objects[f"1f602.{n}"].matrix_world.translation.y
+        self.assertLess(y("teeth"), y("mouth"))
+        self.assertLess(y("mouth"), y("face"))
 
     def test_every_stroke_is_filled_and_outline_hidden(self):
         # Regression: Blender 5 only fills strokes with a non-zero `fill_id`;
         # without it the file contained all the shapes but nothing filled.
-        obj = self.build("1f602")
-        for layer in obj.data.layers:
-            drawing = layer.frames[0].drawing
-            self.assertTrue(all(v.value > 0 for v in drawing.attributes["fill_id"].data), layer.name)
-            self.assertTrue(all(v.value for v in drawing.attributes["hide_stroke"].data), layer.name)
+        bpy = self.build("1f602")
+        gps = [o for o in bpy.data.objects if o.type == "GREASEPENCIL"]
+        self.assertGreater(len(gps), 5)
+        for o in gps:
+            drawing = o.data.layers[0].frames[0].drawing
             ids = [v.value for v in drawing.attributes["fill_id"].data]
-            self.assertEqual(len(ids), len(set(ids)), layer.name)
+            self.assertTrue(all(i > 0 for i in ids), o.name)
+            self.assertEqual(len(ids), len(set(ids)), o.name)
+            self.assertTrue(all(v.value for v in drawing.attributes["hide_stroke"].data), o.name)
 
-    def test_colour_is_converted_to_linear(self):
-        obj = self.build("1f602")
-        mat = next(m for m in obj.data.materials if m.name == "emoji_ffcc4d")
+    def test_colour_is_converted_to_linear_and_materials_are_shared(self):
+        bpy = self.build("1f602")
+        mat = bpy.data.materials["emoji_86a85a"]   # zombie skin base
         r, g, b, a = mat.grease_pencil.fill_color
-        self.assertAlmostEqual(r, 1.0, places=3)
-        self.assertAlmostEqual(g, 0.604, places=3)
-        self.assertAlmostEqual(b, 0.074, places=3)
+        self.assertAlmostEqual(r, B._srgb_to_linear(0x86 / 255), places=3)
+        self.assertAlmostEqual(g, B._srgb_to_linear(0xA8 / 255), places=3)
+        self.assertAlmostEqual(b, B._srgb_to_linear(0x5A / 255), places=3)
+        self.assertEqual(len([m for m in bpy.data.materials if m.name.startswith("emoji_664500")]), 1)
 
-    def test_face_map_is_stored_on_the_object(self):
-        obj = self.build("1f602")
-        fm = json.loads(obj["face_map"])
-        self.assertIn("mouth", fm["parts"])
-        self.assertEqual(obj["emoji_code"], "1f602")
+    def test_face_map_and_markers_are_stored(self):
+        bpy = self.build("1f602")
+        root = bpy.data.objects["1f602"]
+        fm = json.loads(root["face_map"])
+        self.assertEqual(fm["parts"]["mouth"]["object"], "1f602.mouth")
+        scene = bpy.context.scene
+        self.assertEqual([m.name for m in scene.timeline_markers], [a["name"] for a in fm["animations"]])
+        self.assertEqual(scene.frame_end, fm["animations"][-1]["end"])
+
+    def test_animation_evaluates(self):
+        bpy = self.build("1f600")
+        scene = bpy.context.scene
+        fm = json.loads(bpy.data.objects["1f600"]["face_map"])
+        blink = next(a for a in fm["animations"] if a["name"] == "blink")
+        eye = bpy.data.objects["1f600.eye_left"]
+        scene.frame_set(blink["start"])
+        self.assertAlmostEqual(eye.scale[2], 1.0)
+        scene.frame_set(blink["start"] + 4)
+        self.assertAlmostEqual(eye.scale[2], 0.1, places=4)
+        scene.frame_set(blink["end"])
+        self.assertAlmostEqual(eye.scale[2], 1.0, places=4)
+
+    def test_children_follow_the_parent_when_animated(self):
+        bpy = self.build("1f600")
+        scene = bpy.context.scene
+        fm = json.loads(bpy.data.objects["1f600"]["face_map"])
+        talk = next(a for a in fm["animations"] if a["name"] == "talk")
+        teeth = bpy.data.objects["1f600.teeth"]
+        scene.frame_set(talk["start"])
+        rest = teeth.matrix_world.translation.z
+        scene.frame_set(talk["start"] + 9)
+        bpy.context.view_layer.update()
+        self.assertLess(teeth.matrix_world.translation.z, rest)     # the jaw dropped and took the teeth with it
 
 
 if __name__ == "__main__":

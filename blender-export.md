@@ -18,101 +18,167 @@ It is independent of the Three.js pipeline: it reads the SVGs directly, so the d
 ## Usage
 
 ```bash
-# one or a few emoji (shortname, unicode code, or a mix)
-python3 blender.py --emojis joy,1f600,heart_eyes --output ./output/blender/
+# the supported faces (see --list-faces); one or a few by shortname / unicode code
+python3 blender.py --emojis joy,1f600 --output ./output/blender/
 
-# everything (~5 min; one Blender process handles the whole batch)
+# every supported face (`all` and `faces` are the same thing)
 python3 blender.py --emojis all --output ./output/blender/
+
+python3 blender.py --list-faces
+
+# try auto-detection on any other face emoji (generic rig, blink + talk only)
+python3 blender.py --emojis 1f974 --experimental
 
 # just work out the face map: no Blender needed
 python3 blender.py --emojis all --facemap-only --debug-svg
 ```
 
+Only faces are targeted. Emoji not in the `FACES` registry are skipped (with a message) unless `--experimental` is given, and then non-faces are skipped too.
+
 | Flag | Default | |
 |------|---------|--|
-| `--emojis` | required | shortnames, unicode codes, a mix, or `all` |
+| `--emojis` | `faces` | shortnames, unicode codes, a mix, `faces` or `all` |
+| `--list-faces` | off | print the supported faces and their animations |
+| `--experimental` | off | allow emoji outside the registry (generic rig) |
 | `--output` | `./output/blender` | output directory (already git-ignored) |
 | `--naming` | `unicode` | `unicode` (`1f602`) or `shortname` (`joy`) file names |
 | `--size` | `2.0` | emoji size in Blender units |
-| `--curve-segments` | `8` | line segments per Bezier curve, same meaning as the TS CLI |
+| `--skin` | `zombie` | `zombie` replaces the head with generated zombie flesh layers, `none` keeps the original disc |
+| `--gif` | off | also write `<name>.gif`: every animation clip played in a row (needs Pillow, no Blender) |
+| `--gif-size` / `--gif-fps` / `--gif-background` | `320` / `24` / `#ffffff` | GIF pixels, frame rate and background colour |
+| `--curve-segments` | `16` | line segments per Bezier curve |
 | `--blender` | auto | path to the Blender executable |
 | `--facemap-only` | off | write the face-map JSON only, skip Blender |
 | `--debug-svg` | off | write `<name>.facemap.svg`, the shapes outlined and labelled |
 | `--verbose` | off | show all Blender output |
 
-## Output
+## Supported faces
 
-For each emoji:
+`python3 blender.py --list-faces` prints them. Besides the grinning/laughing/crying set: 🤪 😬 😷 🤯 🤓 🥺 🥹 ☠️ and 🙄 (the one used in the demo below). The newer entries rely on `rules` to name shapes auto-detection has no label for (`tongue`, `mask`, `glasses`, `smoke`, `flame_*`, `eyewhite_*`, `bone_*`, `nose`, ...). ☠️ is not a face but has eyes, so it is supported without a zombie head (`zombie_head=False`).
+
+![rolling eyes](demo/rolling_eyes.gif)
+
+*`python3 blender.py --emojis rolling_eyes --gif --facemap-only`*
+
+## The `FACES` registry
+
+Each supported face has an entry in `FACES` (top of the rig section of `blender.py`):
+
+```python
+"1f62d": FaceSpec("loudly crying face",
+    animations=("brow_raise", "tear_drip", "talk"),
+    rules=(Rule("tear_pool", near=(18, 34), radius=2.5, color="#5dadec"),),
+    pivots={}, params={"talk": {"gain": 1.5}})
+```
+
+- `zombie_head`: set `False` when `face` is not a head to replace (the skull).
+- `rules`: relabel a shape by SVG position (and optionally colour) when auto-detection gets it wrong or has no name for it. A rule that matches nothing prints a warning.
+- `pivots`: where each part rotates/scales from. A mode (`center`, `top`, `bottom`, `inner`, `outer`, `left`, `right`) or an `(dx, dy)` offset in SVG units from the part centre. Defaults: brows `inner`, mouth/tongue/tears `top`.
+- `animations`: clips built for this face; `params` tunes them per clip (e.g. `targets`, `gain`).
+
+To add a face: add an entry, run `--facemap-only --debug-svg`, fix labels with `rules`, pick pivots/animations. The test-suite builds every entry and fails on warnings.
+
+## Output
 
 | File | |
 |------|--|
-| `<name>.blend` | Grease Pencil object, one layer per face part |
+| `<name>.blend` | one collection with the rig, animation and a camera |
 | `<name>.facemap.json` | which shapes were identified as what |
-| `<name>.facemap.svg` | (`--debug-svg`) a picture of that mapping, open it in a browser |
+| `<name>.facemap.svg` | (`--debug-svg`) a picture of that mapping |
 
-The face map is also stored inside the `.blend` as the custom property `face_map` (JSON string) on both the object and its Grease Pencil data, plus `emoji_code` on the object.
+### Object-per-part rig
 
-### Layers
+Grease Pencil is easiest to animate (and to put modifiers on) when split into many objects, so every part is its **own object**, parented in a hierarchy. Each object's origin is its pivot, and strokes are stored relative to it, so rotating or scaling an object works around the right point.
 
-Each face part is its own **layer**, and the layer's origin (pivot) is placed at the centre of its shapes. Scaling an eye layer therefore scales around the eye, and rotating a brow layer pivots around the brow.
+```
+1f602                      root empty (animate this to move the whole face)
+├─ 1f602.face              head origin (empty)
+│  ├─ flesh_rim … stitches  zombie head layers
+│  └─ 1f602.blush_left / blush_right
+├─ 1f602.eyes              group empties: eyes, brows, tears
+│  ├─ 1f602.eye_left       └─ pupil_*, highlight_*
+├─ 1f602.brows ─ brow_left, brow_right
+├─ 1f602.mouth             └─ teeth, tongue, mouth_detail
+└─ 1f602.tears ─ tear_left, tear_right
+```
 
-| Layer | Meaning |
-|-------|---------|
-| `face` | the head shape |
-| `eye_left`, `eye_right` | eyes |
-| `pupil_*`, `highlight_*` | shapes inside an eye (darker → pupil, lighter → highlight) |
-| `brow_left`, `brow_right` | eyebrows |
-| `mouth`, `teeth`, `tongue`, `mouth_detail` | mouth and what is inside it |
-| `tear_*`, `blush_*` | tears and cheek blush |
-| `other_01`, `other_02`, … | everything else, split into runs so the original SVG paint order is kept (e.g. the hand in 🤔 stays on top of the mouth) |
+Only parts a face actually has are created. Paint order is kept with a tiny depth offset along Y (later = further from the front camera). **`left`/`right` are screen-side** (`left` has the smaller X).
 
-> **`left`/`right` are screen-side**: as seen by the viewer, `left` has the smaller X. They are *not* the character's own left/right.
+### Zombie head
 
-Layer order is the SVG paint order, so the original picture is reproduced exactly.
+The flat Twemoji head disc is **removed**. `face` becomes an empty (the head's origin) and the head is generated from scratch as a stack of Grease Pencil objects, back to front: `flesh_rim`, `flesh_base` (an irregular, lumpy silhouette, narrower at the chin), `flesh_shadow`, `flesh_highlight`, `cheek_hollows`, `flesh_mottle`, `flesh_pale`, `rot`, `veins`, `bruise`, `wound_rim`, `wound_flesh`, `scar`, `stitches`. They sit behind every face part (the head is always a full canvas-sized disc, even for 🤯 whose Twemoji head is cut off), so the only Twemoji shapes left are the parts you animate on top (`blush_*` stays parented to `face`).
+
+Generation is procedural and seeded by the emoji code: reproducible, but no two faces look alike; all marks stay inside the head outline. A head that is not Twemoji yellow (the red 😡) gets the same flesh tinted toward its colour. `--skin none` keeps the original disc. Palette and layers: `ZOMBIE_LAYERS`, shapes: `zombie_head_layers()`. The layers are listed under `groups.head` in the face map, and `face` is no longer a part there.
+
+### Animation clips
+
+Clips are ordinary keyframes on one timeline (24 fps, 6-frame gaps) with a **timeline marker** at the start of each. Every supported face also gets the idle set (`look_around`, `eye_dart`, `tilt`, see `IDLE_CLIPS`). Each clip returns to the rest pose. Location keys are stored as rest position + offset. Because everything is plain keyframes, you can edit them, or add Grease Pencil modifiers to individual part objects.
+
+| Clip | What moves |
+|------|-----------|
+| `blink` | eyes squash (`targets` param picks which) |
+| `talk` | mouth opens/closes, kept inside the face (`gain`) |
+| `brow_raise` | brows lift |
+| `look` | pupils (or eyes) look left, right and down; this is the rolling-eyes clip |
+| `pulse` | eyes pulse (heart eyes) |
+| `tear_drip` / `tear_well` | tears stretch down from the top / well up from the bottom |
+| `bounce` | the whole face hops |
+| `look_around` | the idle "look left, look right": the pupils (or eyes) lead, then the head follows: the features slide further than the skull (parallax) and the head tilts a touch |
+| `eye_dart` | small quick glances: the eyes jump, hold, jump again |
+| `tilt` | slow, slight head tilt each way (about 5 degrees) |
+| `crazy_eyes` | pupils drift in opposite directions (🤪) |
+| `tongue_wag` | tongue swings (🤪) |
+| `chatter` | mouth and teeth shiver (😬) |
+| `breathe` | mask swells (😷) |
+| `explode` | smoke and flames puff up (🤯) |
+| `shake` / `rattle` | the whole head shakes sideways / rattles (🤯, ☠️) |
+| `glasses_push` | glasses lift and tilt (🤓) |
+| `shimmer` | eye highlights twinkle (🥺 🥹) |
+| `quiver` | the lip trembles (🥺) |
 
 ### `facemap.json`
 
 ```jsonc
 {
-  "code": "1f600",
-  "is_face": true,       // a head plus eyes and/or a mouth were found (deliberately permissive)
-  "complete": true,      // both eyes AND a mouth were found: use this when you need to be sure
-  "groups": { "eyes": ["eye_left", "eye_right"], "mouth": ["mouth", "teeth"] },
+  "code": "1f602", "title": "face with tears of joy",
+  "supported": true,     // in the FACES registry
+  "is_face": true,       // permissive: head + eyes and/or mouth
+  "complete": true,      // both eyes AND a mouth
+  "root": "1f602",
+  "groups": { "eyes": [...], "pupils": [...], "brows": [...], "mouth": [...], "tears": [...] },
+  "animations": [ { "name": "blink", "start": 1, "end": 9 } ],
   "warnings": [],
   "parts": {
     "eye_left": {
-      "layer": "eye_left",
-      "strokes": 1,
-      "center": [-0.333, 0.25],            // Blender X, Z (also the layer's origin)
-      "bbox": [-0.472, 0.056, -0.194, 0.444],
-      "svg_bbox": [9.5, 10.0, 14.5, 17.0], // original SVG coordinates
-      "colors": ["#664500"],
-      "rule": "eye-pair",                  // which heuristic matched it
-      "confidence": 1.0                    // 1.0 strong pair … 0.4 single-eye guess
+      "object": "1f602.eye_left", "parent": "1f602.eyes", "strokes": 1,
+      "pivot": [-0.33, 0.25], "center": [-0.33, 0.25],
+      "bbox": [...], "svg_bbox": [9.5, 10.0, 14.5, 17.0],
+      "colors": ["#664500"], "rule": "eye-pair", "confidence": 1.0
     }
   }
 }
 ```
 
-## Animating the parts
+The same JSON is stored on the root empty as the custom property `face_map` (plus `emoji_code`).
 
-Layers carry their own transform, so basic facial animation is just keyframing layers. A blink, from a Blender Python console or script:
+## GIF preview
 
-```python
-import bpy, json
-
-obj = bpy.data.objects["1f602"]
-gp = obj.data
-face_map = json.loads(obj["face_map"])
-
-for part in face_map["groups"]["eyes"]:
-    name = face_map["parts"][part]["layer"]
-    for frame, squash in ((1, 1.0), (6, 0.1), (11, 1.0)):
-        gp.layers[name].scale = (1.0, 1.0, squash)   # Z is vertical in front view
-        gp.keyframe_insert(data_path=f'layers["{name}"].scale', frame=frame)
+```bash
+pip install pillow
+python3 blender.py --emojis joy,1f633 --gif --facemap-only --output ./output/blender/
 ```
 
-(Verified on Blender 5.2: the eye squashes to 10 % at frame 6 and returns by frame 11.)
+`--gif` writes `<name>.gif` with all the clips played one after another (looping). It replays the same node tree and keyframes that go into the `.blend`, rasterised with Pillow, so it needs neither Blender nor a GPU (add `--facemap-only` to skip the `.blend`). Keyframes are eased with a smoothstep, close to Blender's default interpolation, but it is a preview rather than a Blender render. GIFs are ~0.5-1.3 MB at the default size.
+
+## Animating the parts
+
+```python
+import bpy
+eye = bpy.data.objects["1f602.eye_left"]
+for frame, squash in ((1, 1.0), (6, 0.1), (11, 1.0)):
+    eye.scale[2] = squash                      # Z is vertical in front view
+    eye.keyframe_insert("scale", index=2, frame=frame)
+```
 
 ## How the face detection works
 
@@ -128,6 +194,8 @@ Measured over all 4,009 bundled emoji against Unicode's own face categories (fac
 ## Known limitations
 
 - **Blender version**: developed and tested against **Blender 5.2.2**. The code also targets 4.3–4.5 (it falls back to the older material flags and `grease_pencils_v3`), but that path is **untested**. Older than 4.3 is refused with a clear message.
+- **Verification**: the rig and clips were checked by reading the scene back through the `bpy` module; the real `blender` executable and 4.3–4.5 were not run.
+- **Holes and the zombie head**: a hole is a stroke painted in the colour underneath, so with the zombie head the nerd-glasses lenses are flat flesh colour (the mottling does not show through them).
 - **Fills only.** Twemoji is flat colour, so there are no strokes, gradients, clip paths or masks (14 SVGs use a clip path, which is ignored with a warning in `facemap.json`).
 - **Holes** (rings, the "O" in a button) cannot be cut out of a single Grease Pencil fill, so the hole is painted as an extra stroke in the colour of whatever is behind it. It looks right, but it is not transparent.
 - **Face detection is heuristic**, see above.

@@ -54,7 +54,7 @@ import sys
 import tempfile
 import warnings
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -953,70 +953,917 @@ def build_layers(units: List[Unit]):
     return [(name, parts[name], us) for name, us in ordered], warnings
 
 
-def build_model(code: str, name: str, svg_path: Path, size: float, curve_segments: int):
-    parsed = parse_svg(svg_path, curve_segments)
-    summary = classify(parsed.units, parsed.vb)
-    layer_list, order_warnings = build_layers(parsed.units)
+# ---------------------------------------------------------------------------
+# Supported faces: per-emoji customisation
+# ---------------------------------------------------------------------------
+#
+# Auto-detection (classify() above) does the heavy lifting, but each face we
+# *support* is listed here so it can be customised:
+#
+#   rules       force the label of a shape that auto-detection got wrong
+#   pivots      where a part rotates/scales from (default: see DEFAULT_PIVOTS)
+#   animations  which clips to generate, in timeline order (see CLIPS)
+#   params      per-clip tweaks, e.g. {"blink": {"targets": ("eye_left",)}}
+#
+# Emoji that are not listed here are skipped unless --experimental is given.
 
-    minx, miny, vw, vh = parsed.vb
+@dataclass(frozen=True)
+class Rule:
+    """Force the label of one shape, picked by position in SVG coordinates."""
+    label: str                       # part name, or "other" to demote a shape
+    near: Tuple[float, float]        # the shape whose centroid is closest to this is picked
+    radius: float = 3.0              # ... if it is within this distance
+    color: Optional[str] = None      # ... and, if given, has exactly this '#rrggbb' fill
+
+
+@dataclass(frozen=True)
+class FaceSpec:
+    title: str
+    animations: Tuple[str, ...] = ("blink", "talk")
+    rules: Tuple[Rule, ...] = ()
+    # part -> "center" | "top" | "bottom" | "inner" | "outer" | "left" | "right"
+    #         | (dx, dy) offset from the centre in SVG units (y points down)
+    pivots: Dict[str, object] = field(default_factory=dict)
+    params: Dict[str, dict] = field(default_factory=dict)
+    zombie_head: bool = True         # False when the "face" shape is not a head to replace (the skull)
+
+
+FACES: Dict[str, FaceSpec] = {
+    "1f600": FaceSpec("grinning face", ("blink", "talk")),
+    "1f603": FaceSpec("grinning face with big eyes", ("blink", "talk")),
+    "1f604": FaceSpec("grinning face with smiling eyes", ("talk", "bounce")),       # arc eyes: no blink
+    "1f601": FaceSpec("beaming face with smiling eyes", ("talk", "bounce")),
+    "1f602": FaceSpec("face with tears of joy", ("talk", "brow_raise", "tear_drip", "bounce")),
+    "1f609": FaceSpec("winking face", ("blink", "brow_raise", "talk"),
+                      params={"blink": {"targets": ("eye_left",)}}),                # right eye is the wink
+    "1f60d": FaceSpec("smiling face with heart-eyes", ("pulse", "talk")),
+    "1f62d": FaceSpec("loudly crying face", ("brow_raise", "tear_drip", "talk"),
+                      rules=(Rule("tear_pool", near=(18, 34), radius=2.5, color="#5dadec"),)),
+    "1f61b": FaceSpec("face with tongue", ("blink", "talk")),
+    "1f633": FaceSpec("flushed face", ("blink", "look", "brow_raise", "talk")),
+    "1f644": FaceSpec("face with rolling eyes", ("look", "blink", "talk")),
+    "1f621": FaceSpec("pouting face", ("talk",)),                                   # brows are merged into the eyes
+    "1f610": FaceSpec("neutral face", ("blink", "talk"), params={"talk": {"gain": 4.0}}),  # thin line mouth
+    "1f60a": FaceSpec("smiling face with smiling eyes", ("talk", "bounce")),
+    "1f62e": FaceSpec("face with open mouth", ("blink", "talk"), pivots={"mouth": "center"}),
+    "1f622": FaceSpec("crying face", ("blink", "brow_raise", "tear_drip", "talk")),
+    "1f92a": FaceSpec("zany face", ("blink", "crazy_eyes", "talk", "tongue_wag", "bounce"),
+                      rules=(Rule("tongue", near=(17, 30), radius=2.5, color="#e8596e"),
+                             Rule("tongue_detail", near=(17, 28.5), radius=1.5, color="#dd2f45"))),
+    "1f62c": FaceSpec("grimacing face", ("blink", "chatter", "bounce"),
+                      rules=(Rule("teeth", near=(18, 25), radius=1.5, color="#ffffff"),)),
+    "1f637": FaceSpec("face with medical mask", ("blink", "breathe", "bounce"),
+                      rules=(Rule("mask", near=(18, 24), radius=2.0, color="#f5f8fa"),)),
+    "1f92f": FaceSpec("exploding head", ("explode", "blink", "talk", "shake"),
+                      rules=(Rule("face", near=(18, 24), radius=1.5, color="#ffcb4c"),
+                             Rule("eye_left", near=(12, 20.6), radius=1.5, color="#65471b"),
+                             Rule("eye_right", near=(24, 20.6), radius=1.5, color="#65471b"),
+                             Rule("mouth", near=(18, 28.6), radius=1.5, color="#65471b"),
+                             Rule("smoke", near=(18, 6.5), radius=2.0, color="#ccd6dd"),
+                             Rule("smoke_light_left", near=(12, 7), radius=1.5, color="#e1e8ed"),
+                             Rule("smoke_light_right", near=(27.8, 5.8), radius=1.5, color="#e1e8ed"),
+                             Rule("flame_outer", near=(18.3, 14.5), radius=1.5, color="#f19020"),
+                             Rule("flame_mid", near=(17.8, 13), radius=1.5, color="#f36c24"),
+                             Rule("flame_inner", near=(18.1, 11.6), radius=1.5, color="#ce5c1f")),
+                      pivots={"mouth": "center"}),
+    "1f913": FaceSpec("nerd face", ("blink", "talk", "glasses_push", "bounce"),
+                      rules=(Rule("glasses", near=(18, 14), radius=1.5, color="#292f33"),
+                             Rule("teeth_gap", near=(18, 28.8), radius=1.0, color="#65471b"))),
+    "1f97a": FaceSpec("pleading face", ("shimmer", "brow_raise", "blink", "quiver"),
+                      rules=(Rule("brow_left", near=(10, 9), radius=1.5, color="#65471b"),
+                             Rule("brow_right", near=(26, 9), radius=1.5, color="#65471b"),
+                             Rule("eyewhite_left", near=(11.5, 17.5), radius=1.2, color="#ffffff"),
+                             Rule("eyewhite_right", near=(24.5, 17.5), radius=1.2, color="#ffffff"))),
+    "1f979": FaceSpec("face holding back tears", ("tear_well", "shimmer", "brow_raise", "blink", "talk"),
+                      rules=(Rule("brow_left", near=(10, 9), radius=1.5, color="#65471b"),
+                             Rule("brow_right", near=(26, 9), radius=1.5, color="#65471b"),
+                             Rule("eyewhite_left", near=(11.5, 17.5), radius=1.2, color="#ffffff"),
+                             Rule("eyewhite_right", near=(24.5, 17.5), radius=1.2, color="#ffffff")),
+                      pivots={"tear_left": "bottom", "tear_right": "bottom"}),
+    "2620": FaceSpec("skull and crossbones", ("blink", "rattle", "bounce"), zombie_head=False,
+                     rules=(Rule("face", near=(18, 18), radius=1.5, color="#ccd6dd"),
+                            Rule("eye_left", near=(13.6, 15.5), radius=1.5, color="#292f33"),
+                            Rule("eye_right", near=(22.4, 15.5), radius=1.5, color="#292f33"),
+                            Rule("nose", near=(18, 21.7), radius=1.5, color="#292f33"),
+                            Rule("bone_top_left", near=(5.6, 5.8), radius=2.0, color="#aab8c2"),
+                            Rule("bone_top_right", near=(30.3, 5.8), radius=2.0, color="#aab8c2"),
+                            Rule("bone_bottom_left", near=(5.6, 30), radius=2.0, color="#aab8c2"),
+                            Rule("bone_bottom_right", near=(30.3, 30), radius=2.0, color="#aab8c2"))),
+}
+
+
+# Every supported face also gets the idle set: looking left and right (head turn + tilt),
+# eye darts and a slow head tilt.
+IDLE_CLIPS = ("look_around", "eye_dart", "tilt")
+FACES = {c: replace(sp, animations=sp.animations + tuple(a for a in IDLE_CLIPS if a not in sp.animations))
+         for c, sp in FACES.items()}
+
+
+def apply_rules(units: List[Unit], rules) -> List[str]:
+    """Apply a spec's relabelling rules. Returns warnings for rules that matched nothing."""
+    warns: List[str] = []
+    for r in rules:
+        best = None
+        for u in units:
+            if u.hole or (r.color and u.color != r.color):
+                continue
+            d = math.hypot(u.centroid[0] - r.near[0], u.centroid[1] - r.near[1])
+            if d <= r.radius and (best is None or d < best[0]):
+                best = (d, u)
+        if best is None:
+            warns.append(f"rule for '{r.label}' near {r.near} matched no shape")
+            continue
+        u = best[1]
+        u.label, u.rule, u.confidence = r.label, "spec-rule", 1.0
+    for u in units:  # a hole follows the shape it is cut from
+        if u.hole and u.parent is not None:
+            u.label, u.rule, u.confidence = u.parent.label, "hole-of-" + u.parent.label, u.parent.confidence
+    return warns
+
+
+def generic_spec(labels) -> FaceSpec:
+    """Spec for --experimental: pick clips from whatever parts were detected."""
+    anims = []
+    if "eye_left" in labels or "eye_right" in labels:
+        anims.append("blink")
+    if "brow_left" in labels or "brow_right" in labels:
+        anims.append("brow_raise")
+    if "mouth" in labels:
+        anims.append("talk")
+    return FaceSpec("(auto-detected)", tuple(anims))
+
+
+# ---------------------------------------------------------------------------
+# Rig: one Grease Pencil object per part
+# ---------------------------------------------------------------------------
+
+DEPTH_STEP = 0.001   # world-Y offset per paint-order rank, times `size` (separate objects need depth)
+DEFAULT_PIVOTS = {"brow_left": "inner", "brow_right": "inner", "mouth": "top", "tongue": "top",
+                  "tear_left": "top", "tear_right": "top", "tear_pool": "center"}
+FPS = 24
+CLIP_GAP = 6         # frames between clips on the timeline
+
+
+def _pivot_point(bbox, mode, s: float) -> Tuple[float, float]:
+    """Pivot (Blender X, Z) for a part with world bbox (x0, z0, x1, z1)."""
+    x0, z0, x1, z1 = bbox
+    cx, cz = (x0 + x1) / 2, (z0 + z1) / 2
+    if isinstance(mode, (tuple, list)):
+        return cx + mode[0] * s, cz - mode[1] * s
+    if mode == "top":
+        return cx, z1
+    if mode == "bottom":
+        return cx, z0
+    if mode == "left":
+        return x0, cz
+    if mode == "right":
+        return x1, cz
+    if mode in ("inner", "outer"):
+        near_edge, far_edge = (x0, x1) if abs(x0) < abs(x1) else (x1, x0)
+        return (near_edge if mode == "inner" else far_edge), cz
+    return cx, cz
+
+
+def _parent_key(part: str, present) -> str:
+    """Which node a part hangs from: pupils follow their eye, teeth their mouth..."""
+    cand = "root"
+    if part.startswith(("pupil_", "highlight_", "eyewhite_")):
+        cand = "eye_" + part.split("_", 1)[1]
+    elif part.startswith("eye_"):
+        cand = "eyes"
+    elif part.startswith("brow_"):
+        cand = "brows"
+    elif part in ("teeth", "tongue", "mouth_detail", "teeth_gap"):
+        cand = "mouth"
+    elif part == "tongue_detail":
+        cand = "tongue"
+    elif part.startswith(("smoke", "flame")):
+        cand = "explosion"
+    elif part.startswith("tear_") and part != "tear_pool":
+        cand = "tears"
+    elif part.startswith("blush_"):
+        cand = "face"
+    return cand if cand == "root" or cand in present or cand in ("eyes", "brows", "tears", "explosion") else "root"
+
+
+def build_rig(name: str, layer_list, spec: FaceSpec, vb, size: float):
+    """Turn (key, part, units) groups into a node tree.
+
+    Returns the nodes parents-first. Every node has a *world* position and a
+    *local* location (relative to its parent, which is how Blender stores it);
+    stroke points are relative to the node's own origin, which is its pivot.
+    """
+    minx, miny, vw, vh = vb
     cx, cy = minx + vw / 2, miny + vh / 2
     s = size / max(vw, vh)
 
-    def to_blender(p: Point):
-        # SVG is x-right / y-down; Blender front view is X-right / Z-up.
-        return ((p[0] - cx) * s, 0.0, -(p[1] - cy) * s)
+    parts: Dict[str, dict] = {}
+    for key, part, us in layer_list:
+        pts_by_unit = [[((p[0] - cx) * s, -(p[1] - cy) * s) for p in u.pts] for u in us]   # (X, Z)
+        xs = [p[0] for pts in pts_by_unit for p in pts]
+        zs = [p[1] for pts in pts_by_unit for p in pts]
+        parts[key] = {"key": key, "part": part, "units": us, "pts": pts_by_unit,
+                      "bbox": (min(xs), min(zs), max(xs), max(zs)), "first_order": us[0].order}
 
-    layers_out = []
+    # Depth: later-painted shapes sit closer to the camera (which looks along +Y).
+    rank = {k: i for i, k in enumerate(sorted(parts, key=lambda k: parts[k]["first_order"]))}
+
+    present = set(parts)
+    nodes: Dict[str, dict] = {"root": {"key": "root", "kind": "empty", "parent": "root-none", "world": [0.0, 0.0, 0.0]}}
+    for key, p in parts.items():
+        mode = spec.pivots.get(key, DEFAULT_PIVOTS.get(key, "center"))
+        px, pz = _pivot_point(p["bbox"], mode, s)
+        nodes[key] = {"key": key, "kind": "gp", "parent": _parent_key(key, present),
+                      "world": [px, -rank[key] * DEPTH_STEP * size, pz], "data": p}
+    for group in ("eyes", "brows", "tears", "explosion"):
+        kids = [n for n in nodes.values() if n.get("parent") == group]
+        if kids:
+            gx = sum(k["world"][0] for k in kids) / len(kids)
+            gz = sum(k["world"][2] for k in kids) / len(kids)
+            nodes[group] = {"key": group, "kind": "empty", "parent": "root", "world": [gx, 0.0, gz]}
+
+    def depth(k):
+        d = 0
+        while nodes[k]["parent"] != "root-none":
+            k = nodes[k]["parent"]
+            d += 1
+        return d
+
+    ordered = sorted(nodes.values(), key=lambda n: (depth(n["key"]), n.get("data", {}).get("first_order", -1)))
+    out = []
+    for n in ordered:
+        par = nodes.get(n["parent"])
+        pw = par["world"] if par else [0.0, 0.0, 0.0]
+        node = {
+            "name": name if n["key"] == "root" else f"{name}.{n['key']}",
+            "part": n["key"],
+            "kind": n["kind"],
+            "parent": None if n["parent"] == "root-none" else (name if n["parent"] == "root" else f"{name}.{n['parent']}"),
+            "world": n["world"],
+            "location": [n["world"][i] - pw[i] for i in range(3)],
+        }
+        if n["kind"] == "gp":
+            d = n["data"]
+            px, pz = n["world"][0], n["world"][2]
+            node["strokes"] = [
+                {"points": [[x - px, 0.0, z - pz] for x, z in pts], "color": u.color, "alpha": u.alpha, "hole": u.hole}
+                for u, pts in zip(d["units"], d["pts"])
+            ]
+            node["bbox"] = list(d["bbox"])
+            node["units"] = d["units"]
+        out.append(node)
+    return out
+
+
+
+# ---------------------------------------------------------------------------
+# Zombie head: replaces the flat Twemoji head with many layers of zombie flesh
+# ---------------------------------------------------------------------------
+#
+# The original head disc is thrown away. `face` becomes an empty and the head is
+# rebuilt from scratch as a stack of Grease Pencil objects (an irregular, lumpy
+# silhouette, shading, mottling, rot, a wound, veins, a bruise, stitches), so
+# the only Twemoji shapes left are the face parts, which animate on top.
+# Everything is procedural and seeded by the emoji code: reproducible, but no
+# two faces look identical.
+
+SKIN_STYLES = ("zombie", "none")
+TWEMOJI_YELLOW = "#ffcc4d"
+# Paint order, back to front: part name -> (colour, alpha)
+ZOMBIE_LAYERS = {
+    "flesh_rim": ("#4f6b34", 1.0),        # dark outer shell (shows as the rim)
+    "flesh_base": ("#86a85a", 1.0),       # main flesh
+    "flesh_shadow": ("#5f7d3a", 0.75),    # jaw / underside shading
+    "flesh_highlight": ("#b4cb84", 0.55), # forehead light
+    "cheek_hollows": ("#5f7d3a", 0.45),   # sunken cheeks
+    "flesh_mottle": ("#5f7d3a", 0.6),     # dark mottled patches
+    "flesh_pale": ("#c2d596", 0.5),       # sickly pale patches
+    "rot": ("#5b5a2c", 0.7),              # brown decay near the edge
+    "veins": ("#5a4a86", 0.6),            # purple veins
+    "bruise": ("#7a3f9e", 0.55),          # bruise
+    "wound_rim": ("#6e2424", 1.0),        # torn wound edge
+    "wound_flesh": ("#b04a48", 1.0),      # exposed muscle
+    "scar": ("#5a2d2d", 1.0),             # forehead scar
+    "stitches": ("#2b2320", 1.0),         # stitches across the scar
+}
+ZOMBIE_PARTS = tuple(ZOMBIE_LAYERS)
+
+
+def _is_twemoji_yellow(color: str) -> bool:
+    r, g, b = hex_rgb(color)
+    return r >= 240 and 195 <= g <= 212 and b <= 90
+
+
+def _mix_hex(a: str, b: str, t: float) -> str:
+    ra, rb = hex_rgb(a), hex_rgb(b)
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(ra, rb))
+
+
+def _blob(rng, cx, cz, r, n=14, wobble=0.35):
+    """A lumpy closed polygon around (cx, cz)."""
+    phase = rng.uniform(0, math.tau)
+    rad = [r * (1 + wobble * math.sin(3 * math.tau * i / n + phase) * rng.uniform(0.5, 1.0)
+                + 0.15 * rng.uniform(-1, 1)) for i in range(n)]
+    return [(cx + rad[i] * math.cos(math.tau * i / n), cz + rad[i] * math.sin(math.tau * i / n)) for i in range(n)]
+
+
+def _bar(p0, p1, width):
+    (x0, z0), (x1, z1) = p0, p1
+    dx, dz = x1 - x0, z1 - z0
+    L = math.hypot(dx, dz) or 1.0
+    nx, nz = -dz / L * width / 2, dx / L * width / 2
+    return [(x0 + nx, z0 + nz), (x1 + nx, z1 + nz), (x1 - nx, z1 - nz), (x0 - nx, z0 - nz)]
+
+
+def zombie_head_layers(code: str, radius: float):
+    """{part: [polygon, ...]} in head-centred (X, Z) coordinates, parts in paint order."""
+    import random
+    rng = random.Random(f"zombie-{code}")
+    R = radius
+    lumps = [(k, rng.uniform(0.012, 0.03) * (1 if k < 4 else 0.6), rng.uniform(0, math.tau)) for k in (2, 3, 5, 7)]
+
+    def head_r(a):
+        """Radius of the head silhouette at angle a: round-ish, lumpy, narrower at the chin."""
+        r = 1.0 + sum(amp * math.sin(k * a + ph) for k, amp, ph in lumps)
+        r *= 1.0 - 0.07 * max(0.0, -math.sin(a)) ** 1.5      # chin
+        r *= 1.0 + 0.02 * max(0.0, math.sin(a))              # cranium
+        return R * 0.985 * r
+
+    def outline(scale=1.0, dz=0.0, n=64):
+        return [(scale * head_r(math.tau * i / n) * math.cos(math.tau * i / n),
+                 scale * head_r(math.tau * i / n) * math.sin(math.tau * i / n) + dz * R) for i in range(n)]
+
+    def clamp(pts, k=0.93):
+        out = []
+        for x, z in pts:
+            lim = head_r(math.atan2(z, x)) * k
+            d = math.hypot(x, z)
+            f = lim / d if d > lim else 1.0
+            out.append((x * f, z * f))
+        return out
+
+    def band(a0, a1, r_out, r_in, shift=(0.0, 0.0), n=18):
+        """A crescent hugging the rim between two angles."""
+        outer = [(r_out * head_r(a) * math.cos(a), r_out * head_r(a) * math.sin(a))
+                 for a in (a0 + (a1 - a0) * i / n for i in range(n + 1))]
+        inner = [(r_in * head_r(a) * math.cos(a) + shift[0] * R, r_in * head_r(a) * math.sin(a) + shift[1] * R)
+                 for a in (a1 - (a1 - a0) * i / n for i in range(n + 1))]
+        return clamp(outer + inner, 0.985)
+
+    def spot(rmin, rmax):
+        a, d = rng.uniform(0, math.tau), rng.uniform(rmin, rmax)
+        return d * head_r(a) * math.cos(a), d * head_r(a) * math.sin(a)
+
+    out: Dict[str, list] = {k: [] for k in ZOMBIE_LAYERS}
+    out["flesh_rim"] = [outline(1.0)]
+    out["flesh_base"] = [outline(0.955, dz=-0.012)]
+    out["flesh_shadow"] = [band(math.radians(195), math.radians(345), 0.955, 0.55, shift=(0.0, 0.12))]
+    out["flesh_highlight"] = [band(math.radians(55), math.radians(150), 0.93, 0.7, shift=(-0.05, -0.02))]
+    for side in (-1, 1):
+        out["cheek_hollows"].append(clamp(_blob(rng, side * R * 0.55, -R * 0.2, R * 0.2, wobble=0.2)))
+    for _ in range(10):
+        x, z = spot(0.1, 0.8)
+        out["flesh_mottle"].append(clamp(_blob(rng, x, z, R * rng.uniform(0.07, 0.17))))
+    for _ in range(7):
+        x, z = spot(0.1, 0.75)
+        out["flesh_pale"].append(clamp(_blob(rng, x, z, R * rng.uniform(0.06, 0.13))))
+    for _ in range(4):                       # decay creeps in from the rim
+        x, z = spot(0.72, 0.88)
+        out["rot"].append(clamp(_blob(rng, x, z, R * rng.uniform(0.06, 0.12), wobble=0.5)))
+    for _ in range(3):                       # a few branching veins
+        a = rng.uniform(0, math.tau)
+        x, z = 0.78 * head_r(a) * math.cos(a), 0.78 * head_r(a) * math.sin(a)
+        ang = math.atan2(-z, -x) + rng.uniform(-0.5, 0.5)
+        for _seg in range(4):
+            ang += rng.uniform(-0.6, 0.6)
+            ln = R * rng.uniform(0.08, 0.14)
+            nx, nz = x + ln * math.cos(ang), z + ln * math.sin(ang)
+            out["veins"].append(clamp(_bar((x, z), (nx, nz), R * 0.022)))
+            x, z = nx, nz
+    bruise_side = rng.choice((-1, 1))
+    out["bruise"].append(clamp(_blob(rng, bruise_side * R * 0.5, -R * 0.3, R * 0.2, wobble=0.25)))
+    wx, wz = -bruise_side * R * 0.52, R * 0.05            # torn-open cheek on the other side
+    out["wound_rim"].append(clamp(_blob(rng, wx, wz, R * 0.17, n=16, wobble=0.5)))
+    out["wound_flesh"].append(clamp(_blob(rng, wx, wz, R * 0.11, n=14, wobble=0.45)))
+    tilt = rng.uniform(-0.25, 0.25)                       # stitched scar across the forehead
+    cx, cz = bruise_side * R * 0.1, R * 0.64
+    half = R * 0.28
+    a = (cx - half * math.cos(tilt), cz - half * math.sin(tilt))
+    b = (cx + half * math.cos(tilt), cz + half * math.sin(tilt))
+    out["scar"].append(clamp(_bar(a, b, R * 0.045)))
+    nx, nz = -math.sin(tilt), math.cos(tilt)
+    for i in range(5):
+        t = (i + 0.5) / 5
+        mx, mz = a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t
+        h = R * 0.075
+        out["stitches"].append(clamp(_bar((mx - nx * h, mz - nz * h), (mx + nx * h, mz + nz * h), R * 0.02)))
+    return out
+
+
+def apply_zombie_skin(code: str, name: str, nodes: list, size: float) -> List[str]:
+    """Replace the head disc by the zombie head: `face` becomes an empty with one object per layer."""
+    face = next((n for n in nodes if n["part"] == "face" and n["kind"] == "gp"), None)
+    if face is None:
+        return ["zombie skin: no face part found"]
+    radius = size / 2                       # every Twemoji head fills the canvas (even if the shape is cut off)
+    cx, cz = -face["world"][0], -face["world"][2]                             # canvas centre, face-local
+    head_colors = {st["color"] for st in face["strokes"]}
+    tint = None if all(_is_twemoji_yellow(c) for c in head_colors) else sorted(head_colors)[0]   # e.g. red angry face
+    # A hole is painted in the colour underneath (see "Holes" in the docs). Under a yellow
+    # head that is yellow; it now has to be flesh, or the nerd glasses get yellow lenses.
+    flesh = ZOMBIE_LAYERS["flesh_base"][0] if not tint else _mix_hex(ZOMBIE_LAYERS["flesh_base"][0], tint, 0.45)
+    for n in nodes:
+        for st in n.get("strokes", ()):
+            if st.get("hole") and _is_twemoji_yellow(st["color"]):
+                st["color"] = flesh
+    face["kind"] = "empty"                      # the disc is gone; `face` is now just the head's origin
+    for k in ("strokes", "bbox", "units", "data"):
+        face.pop(k, None)
+    names = list(ZOMBIE_LAYERS)
+    gap = DEPTH_STEP * size                     # the room between this head and the next painted part
+    for i, (part, polys) in enumerate(zombie_head_layers(code, radius).items()):
+        color, alpha = ZOMBIE_LAYERS[part]
+        if tint:
+            color = _mix_hex(color, tint, 0.45)
+        dy = -(i + 1) / (len(names) + 1) * gap
+        xs = [x for p in polys for x, _ in p]
+        zs = [z for p in polys for _, z in p]
+        nodes.append({
+            "name": f"{name}.{part}", "part": part, "kind": "gp", "parent": face["name"],
+            "world": [face["world"][0], face["world"][1] + dy, face["world"][2]],
+            "location": [0.0, dy, 0.0],
+            "strokes": [{"points": [[x + cx, 0.0, z + cz] for x, z in poly], "color": color,
+                         "alpha": alpha, "hole": False} for poly in polys],
+            "bbox": [min(xs) + cx + face["world"][0], min(zs) + cz + face["world"][2],
+                     max(xs) + cx + face["world"][0], max(zs) + cz + face["world"][2]],
+            "skin": True,
+        })
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Animation clips (plain keyframe data, so they can be tested without Blender)
+# ---------------------------------------------------------------------------
+#
+# A clip builder returns (tracks, length_in_frames). A track is
+#   {"node", "path": "location"|"scale"|"rotation_euler", "index", "keys": [[frame, value], ...]}
+# Frames are relative to the clip start; values for "location" are offsets from the rest pose.
+
+def _track(node, path, index, keys):
+    rest = node["location"][index] if path == "location" else 0.0
+    return {"node": node["name"], "path": path, "index": index, "keys": [[f, rest + v] for f, v in keys]}
+
+
+def _clip_blink(P, size, p):
+    targets = [k for k in (p.get("targets") or ("eye_left", "eye_right")) if k in P]
+    sq = p.get("squash", 0.1)
+    return [_track(P[k], "scale", 2, [(0, 1), (3, sq), (5, sq), (8, 1)]) for k in targets], 8
+
+
+def _clip_talk(P, size, p):
+    if "mouth" not in P:
+        return [], 24
+    gain = p.get("gain", 1.0)
+    # Keep the jaw inside the face: scaling about the pivot should not push the
+    # bottom of the mouth past the face edge. Mouths that already reach the
+    # edge (face with tongue) still get a small movement.
+    pz, z0 = P["mouth"]["world"][2], P["mouth"]["bbox"][1]
+    if pz > z0:
+        kmax = (pz + 0.97 * size / 2) / (pz - z0)
+        gain = max(0.25, min(gain, (kmax - 1) / 0.6))
+    frames = (0, 3, 6, 9, 12, 15, 18, 24)
+    openness = (0, .5, -.3, .6, -.2, .4, -.1, 0)
+    return [
+        _track(P["mouth"], "scale", 2, [(f, max(0.25, 1 + o * gain)) for f, o in zip(frames, openness)]),
+        _track(P["mouth"], "scale", 0, [(f, 1 - 0.08 * o * gain) for f, o in zip(frames, openness)]),
+    ], 24
+
+
+def _clip_brow_raise(P, size, p):
+    nodes = [P["brows"]] if "brows" in P else [P[k] for k in ("brow_left", "brow_right") if k in P]
+    lift = p.get("lift", 0.06 * size)
+    return [_track(n, "location", 2, [(0, 0), (4, lift), (12, lift), (16, 0)]) for n in nodes], 16
+
+
+def _clip_look(P, size, p):
+    pupils = [k for k in ("pupil_left", "pupil_right") if k in P]
+    targets = pupils or [k for k in ("eye_left", "eye_right") if k in P]
+    out = []
+    for k in targets:
+        node = P[k]
+        if pupils:
+            eye = P.get("eye_" + k.split("_")[1])
+            width = (eye["bbox"][2] - eye["bbox"][0]) if eye else 0.1 * size
+            d = p.get("dist", 0.18 * width)
+        else:
+            d = p.get("dist", 0.03 * size)
+        out.append(_track(node, "location", 0, [(0, 0), (8, -d), (16, -d), (20, 0), (28, d), (36, 0)]))
+        out.append(_track(node, "location", 2, [(0, 0), (20, 0), (24, d / 2), (32, d / 2), (36, 0)]))
+    return out, 36
+
+
+def _clip_pulse(P, size, p):
+    amt = p.get("amount", 0.25)
+    keys = [(0, 1), (4, 1 + amt), (8, 1), (12, 1 + amt), (16, 1)]
+    return [_track(P[k], "scale", i, keys) for k in ("eye_left", "eye_right") if k in P for i in (0, 2)], 16
+
+
+def _clip_tear_drip(P, size, p):
+    tears = [P[k] for k in ("tear_left", "tear_right") if k in P]
+    out = [_track(n, "scale", 2, [(0, 1), (12, p.get("stretch", 1.4)), (24, 1)]) for n in tears]
+    if "tear_pool" in P:
+        out.append(_track(P["tear_pool"], "scale", 0, [(0, 1), (12, 1.06), (24, 1)]))
+    return out, 24
+
+
+def _clip_bounce(P, size, p):
+    h = p.get("height", 0.05 * size)
+    return [_track(P["root"], "location", 2, [(0, 0), (4, h), (8, 0), (12, h * 0.6), (16, 0)])], 16
+
+
+def _eye_dist(P, side, size, frac):
+    eye = P.get("eye_" + side)
+    return frac * ((eye["bbox"][2] - eye["bbox"][0]) if eye else 0.1 * size)
+
+
+def _gaze_nodes(P):
+    """(nodes, is_pupil, side) that show where the face is looking: pupils, else the eyes themselves."""
+    out = []
+    for side in ("left", "right"):
+        if "pupil_" + side in P:
+            out.append((P["pupil_" + side], side, 0.2))
+        elif "eye_" + side in P:
+            out.append((P["eye_" + side], side, 0.08))
+    return out
+
+
+def _head_and_feature_nodes(P):
+    """Head layers (the face empty, the explosion) vs features (everything else hanging from the root)."""
+    head = [P[k] for k in ("face", "explosion") if k in P]
+    skip = {"root", "face", "explosion"}
+    feats = [n for k, n in P.items()
+             if k not in skip and not k.startswith(("bone_", "skin_")) and n.get("parent") == P["root"]["name"]
+             and not n.get("skin")]
+    return head, feats
+
+
+def _clip_look_around(P, size, p):
+    """Eyes lead, then the head turns (features slide further than the skull: parallax) and tilts a touch."""
+    gaze = _gaze_nodes(P)
+    if not gaze:
+        return [], 72
+    f, h = p.get("turn", 0.045 * size), p.get("head", 0.018 * size)
+    tilt = p.get("tilt", 0.07)
+    t = (0, 8, 16, 30, 40, 48, 56, 66, 72)
+    eye_dir = (0, -1, -1, -1, 0, 1, 1, 1, 0)            # the eyes get there first...
+    head_dir = (0, 0, -1, -1, 0, 0, 1, 1, 0)            # ...and the head follows
+    out = []
+    for node, side, frac in gaze:
+        d = _eye_dist(P, side, size, frac)
+        out.append(_track(node, "location", 0, [(a, d * b) for a, b in zip(t, eye_dir)]))
+    head, feats = _head_and_feature_nodes(P)
+    for n in head:
+        out.append(_track(n, "location", 0, [(a, h * b) for a, b in zip(t, head_dir)]))
+    for n in feats:
+        out.append(_track(n, "location", 0, [(a, f * b) for a, b in zip(t, head_dir)]))
+    out.append(_track(P["root"], "rotation_euler", 1, [(a, tilt * b) for a, b in zip(t, head_dir)]))
+    return out, 72
+
+
+def _clip_eye_dart(P, size, p):
+    """Quick small glances: the eyes jump, hold, jump again."""
+    gaze = _gaze_nodes(P)
+    out = []
+    for node, side, frac in gaze:
+        d = _eye_dist(P, side, size, frac) * p.get("amount", 0.8)
+        out.append(_track(node, "location", 0, [(0, 0), (3, 0.7 * d), (12, 0.7 * d), (14, -0.6 * d),
+                                                 (23, -0.6 * d), (25, 0.25 * d), (33, 0.25 * d), (36, 0)]))
+        out.append(_track(node, "location", 2, [(0, 0), (3, 0.3 * d), (12, 0.3 * d), (14, -0.2 * d),
+                                                 (23, -0.2 * d), (25, 0), (33, 0), (36, 0)]))
+    return out, 36
+
+
+def _clip_tilt(P, size, p):
+    a = p.get("angle", 0.09)
+    return [_track(P["root"], "rotation_euler", 1, [(0, 0), (10, a), (20, 0), (30, -a), (40, 0)])], 40
+
+
+def _clip_chatter(P, size, p):
+    if "mouth" not in P:
+        return [], 12
+    a = p.get("amp", 0.012 * size)
+    keys = [(0, 0)] + [(i, a if i % 2 else -a) for i in range(1, 12)] + [(12, 0)]
+    return [_track(P["mouth"], "location", 0, keys)], 12
+
+
+def _clip_breathe(P, size, p):
+    amt = p.get("amount", 0.04)
+    keys = [(0, 1), (10, 1 + amt), (20, 1)]
+    return [_track(P[k], "scale", i, keys) for k in p.get("targets", ("mask",)) if k in P for i in (0, 2)], 20
+
+
+def _clip_glasses_push(P, size, p):
+    if "glasses" not in P:
+        return [], 14
+    up = p.get("lift", 0.04 * size)
+    return [_track(P["glasses"], "location", 2, [(0, 0), (4, up), (10, up), (14, 0)]),
+            _track(P["glasses"], "rotation_euler", 1, [(0, 0), (4, -0.08), (10, -0.08), (14, 0)])], 14
+
+
+def _clip_tongue_wag(P, size, p):
+    if "tongue" not in P:
+        return [], 20
+    a = p.get("angle", 0.3)
+    return [_track(P["tongue"], "rotation_euler", 1, [(0, 0), (4, a), (8, -a), (12, a), (16, -a), (20, 0)])], 20
+
+
+def _clip_crazy_eyes(P, size, p):
+    out = []
+    for sign, side in ((1, "left"), (-1, "right")):       # the pupils drift in opposite directions
+        if "pupil_" + side not in P:
+            continue
+        eye = P.get("eye_" + side)
+        d = p.get("dist", 0.2 * ((eye["bbox"][2] - eye["bbox"][0]) if eye else 0.1 * size))
+        n = P["pupil_" + side]
+        out.append(_track(n, "location", 0, [(0, 0), (6, sign * d), (12, 0), (18, -sign * d), (24, 0)]))
+        out.append(_track(n, "location", 2, [(0, 0), (6, -d / 2), (12, 0), (18, d / 2), (24, 0)]))
+    return out, 24
+
+
+def _clip_shimmer(P, size, p):
+    amt = p.get("amount", 0.25)
+    keys = [(0, 1), (6, 1 + amt), (12, 1), (18, 1 + amt), (24, 1)]
+    return [_track(P[k], "scale", i, keys) for k in ("highlight_left", "highlight_right") if k in P for i in (0, 2)], 24
+
+
+def _clip_quiver(P, size, p):
+    if "mouth" not in P:
+        return [], 12
+    keys = [(0, 1), (2, 1.12), (4, 0.92), (6, 1.1), (8, 0.93), (10, 1.08), (12, 1)]
+    return [_track(P["mouth"], "scale", 0, keys)], 12
+
+
+def _clip_tear_well(P, size, p):
+    tears = [P[k] for k in ("tear_left", "tear_right") if k in P]
+    return [_track(n, "scale", 2, [(0, 1), (12, p.get("stretch", 1.8)), (24, 1)]) for n in tears], 24
+
+
+def _clip_explode(P, size, p):
+    if "explosion" not in P:
+        return [], 20
+    amt, up = p.get("amount", 0.12), p.get("lift", 0.05 * size)
+    keys = [(0, 1), (5, 1 + amt), (14, 1 + amt / 2), (20, 1)]
+    return [_track(P["explosion"], "scale", 0, keys), _track(P["explosion"], "scale", 2, keys),
+            _track(P["explosion"], "location", 2, [(0, 0), (5, up), (14, up / 2), (20, 0)])], 20
+
+
+def _clip_shake(P, size, p):
+    a = p.get("amp", 0.025 * size)
+    keys = [(0, 0)] + [(i, a if i % 2 else -a) for i in range(1, 12)] + [(12, 0)]
+    return [_track(P["root"], "location", 0, keys)], 12
+
+
+def _clip_rattle(P, size, p):
+    a = p.get("angle", 0.12)
+    keys = [(0, 0), (2, a), (4, -a), (6, a), (8, -a), (10, a * 0.8), (12, -a * 0.8), (14, 0)]
+    return [_track(P["root"], "rotation_euler", 1, keys)], 14
+
+
+CLIPS = {"blink": _clip_blink, "talk": _clip_talk, "brow_raise": _clip_brow_raise, "look": _clip_look,
+         "pulse": _clip_pulse, "tear_drip": _clip_tear_drip, "bounce": _clip_bounce,
+         "chatter": _clip_chatter, "breathe": _clip_breathe, "glasses_push": _clip_glasses_push,
+         "tongue_wag": _clip_tongue_wag, "crazy_eyes": _clip_crazy_eyes, "shimmer": _clip_shimmer,
+         "quiver": _clip_quiver, "tear_well": _clip_tear_well, "explode": _clip_explode,
+         "shake": _clip_shake, "rattle": _clip_rattle, "look_around": _clip_look_around,
+         "eye_dart": _clip_eye_dart, "tilt": _clip_tilt}
+
+
+def build_clips(spec: FaceSpec, nodes, size: float):
+    """Lay the spec's clips out one after another on a timeline."""
+    P = {n["part"]: n for n in nodes}
+    clips, warns, start = [], [], 1
+    for cname in spec.animations:
+        if cname not in CLIPS:
+            warns.append(f"unknown animation '{cname}'")
+            continue
+        tracks, length = CLIPS[cname](P, size, spec.params.get(cname, {}))
+        if not tracks:
+            warns.append(f"animation '{cname}' skipped: the parts it needs were not found")
+            continue
+        for t in tracks:
+            t["keys"] = [[start + f, v] for f, v in t["keys"]]
+        clips.append({"name": cname, "start": start, "end": start + length, "tracks": tracks})
+        start += length + CLIP_GAP
+    return clips, warns
+
+
+def _bbox_inside(a, b) -> bool:
+    return a[0] >= b[0] and a[1] >= b[1] and a[2] <= b[2] and a[3] <= b[3]
+
+
+def _lift_holed_shapes(units: List[Unit]) -> None:
+    """Paint a shape with holes *before* the shapes that sit inside its holes.
+
+    A hole is painted as a stroke in the colour underneath, so a shape that was
+    drawn first and shows through the hole (the eyes behind the nerd glasses)
+    would be covered. Those shapes never touch the solid part, so drawing the
+    holed shape first looks identical.
+    """
+    for u in units:
+        holes = [h for h in units if h.hole and h.parent is u]
+        if not holes:
+            continue
+        inside = [v.order for v in units if not v.hole and v is not u and v.order < u.order
+                  and any(_bbox_inside(v.bbox, h.bbox) and point_in_polygon(v.centroid, h.pts) for h in holes)]
+        if inside:
+            shift = min(inside) - 0.5 - u.order
+            u.order += shift
+            for h in holes:
+                h.order += shift
+    units.sort(key=lambda u: u.order)
+
+
+def build_model(code: str, name: str, svg_path: Path, size: float, curve_segments: int,
+                spec: Optional[FaceSpec] = None, skin: str = "zombie"):
+    parsed = parse_svg(svg_path, curve_segments)
+    summary = classify(parsed.units, parsed.vb)
+    supported = spec is not None or code in FACES
+    spec = spec or FACES.get(code)
+    rule_warnings: List[str] = []
+    if spec is not None:
+        rule_warnings = apply_rules(parsed.units, spec.rules)
+    labels = {u.label for u in parsed.units}
+    if spec is None:
+        spec = generic_spec(labels)
+    _lift_holed_shapes(parsed.units)
+    layer_list, order_warnings = build_layers(parsed.units)
+    nodes = build_rig(name, layer_list, spec, parsed.vb, size)
+    clips, clip_warnings = build_clips(spec, nodes, size)
+    skin_warnings = apply_zombie_skin(code, name, nodes, size) if skin == "zombie" and spec.zombie_head else []
+
+    s = size / max(parsed.vb[2], parsed.vb[3])
     facemap_parts: Dict[str, dict] = {}
-    for lname, part, us in layer_list:
-        strokes = []
-        xs, zs = [], []
-        for u in us:
-            pts = [to_blender(p) for p in u.pts]
-            xs += [p[0] for p in pts]
-            zs += [p[2] for p in pts]
-            strokes.append({"points": pts, "color": u.color, "alpha": u.alpha, "hole": u.hole})
-        ox, oz = (min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2
-        for st in strokes:
-            st["points"] = [[p[0] - ox, p[1], p[2] - oz] for p in st["points"]]
-        layers_out.append({"name": lname, "part": part, "origin": [ox, 0.0, oz], "strokes": strokes})
-        if part != "other":
-            facemap_parts[part] = {
-                "layer": lname,
-                "strokes": len(strokes),
-                "center": [ox, oz],
-                "bbox": [min(xs), min(zs), max(xs), max(zs)],
-                "svg_bbox": [min(u.bbox[0] for u in us), min(u.bbox[1] for u in us),
-                             max(u.bbox[2] for u in us), max(u.bbox[3] for u in us)],
-                "colors": sorted({u.color for u in us}),
-                "rule": us[0].rule,
-                "confidence": us[0].confidence,
+    for n in nodes:
+        if n["kind"] != "gp" or n["part"].startswith("other_"):
+            continue
+        if n.get("skin"):
+            x0, z0, x1, z1 = n["bbox"]
+            facemap_parts[n["part"]] = {
+                "object": n["name"], "parent": n["parent"], "strokes": len(n["strokes"]),
+                "pivot": [n["world"][0], n["world"][2]], "center": [(x0 + x1) / 2, (z0 + z1) / 2],
+                "bbox": [x0, z0, x1, z1], "colors": [n["strokes"][0]["color"]],
+                "rule": "zombie-head", "confidence": 1.0,
             }
-
+            continue
+        us = n["units"]
+        x0, z0, x1, z1 = n["bbox"]
+        facemap_parts[n["part"]] = {
+            "object": n["name"],
+            "parent": n["parent"],
+            "strokes": len(us),
+            "pivot": [n["world"][0], n["world"][2]],
+            "center": [(x0 + x1) / 2, (z0 + z1) / 2],
+            "bbox": [x0, z0, x1, z1],
+            "svg_bbox": [min(u.bbox[0] for u in us), min(u.bbox[1] for u in us),
+                         max(u.bbox[2] for u in us), max(u.bbox[3] for u in us)],
+            "colors": sorted({u.color for u in us}),
+            "rule": us[0].rule,
+            "confidence": us[0].confidence,
+        }
     groups = {
         "eyes": [p for p in ("eye_left", "eye_right") if p in facemap_parts],
         "pupils": [p for p in ("pupil_left", "pupil_right") if p in facemap_parts],
         "brows": [p for p in ("brow_left", "brow_right") if p in facemap_parts],
         "mouth": [p for p in ("mouth", "teeth", "tongue", "mouth_detail") if p in facemap_parts],
+        "tears": [p for p in ("tear_left", "tear_right", "tear_pool") if p in facemap_parts],
+        "head": [p for p in ZOMBIE_PARTS if p in facemap_parts],
     }
     facemap = {
         "code": code,
         "name": name,
-        "is_face": summary["is_face"],
-        "complete": bool(summary.get("complete")),
+        "title": spec.title,
+        "supported": supported,
+        "is_face": bool(summary["is_face"]) or supported,
+        "complete": {"eye_left", "eye_right"} <= labels and bool(labels & {"mouth", "mask", "nose"}),   # a mask/skull has no visible mouth
         "note": "left/right are screen-side (as seen by the viewer), not the character's own left/right",
+        "root": name,
         "parts": facemap_parts,
         "groups": {k: v for k, v in groups.items() if v},
-        "warnings": parsed.warnings + order_warnings,
+        "animations": [{"name": c["name"], "start": c["start"], "end": c["end"]} for c in clips],
+        "skin": "zombie" if any(n.get("skin") for n in nodes) else "none",
+        "warnings": parsed.warnings + rule_warnings + order_warnings + clip_warnings + skin_warnings,
     }
-    model = {
-        "name": name,
-        "code": code,
-        "size": size,
-        "layers": layers_out,
-        "facemap": facemap,
-    }
+    for n in nodes:
+        n.pop("units", None)  # not JSON-serialisable and not needed Blender-side
+    model = {"name": name, "code": code, "size": size, "fps": FPS, "nodes": nodes, "clips": clips,
+             "facemap": facemap}
     return model, parsed
+
+
+# ---------------------------------------------------------------------------
+# GIF preview (host side, no Blender): evaluates the rig + clips and rasterises
+# ---------------------------------------------------------------------------
+#
+# This replays the same node tree and keyframes that go into the .blend, so it
+# is a quick way to look at the animation. It needs Pillow (pip install pillow).
+# Keyframes are eased with a smoothstep, close to Blender's default Bezier
+# interpolation, but it is a preview, not a Blender render.
+
+def _curves(model: dict):
+    """(node, path, index) -> sorted [(frame, value)] across all clips."""
+    out: Dict[Tuple[str, str, int], List[Tuple[float, float]]] = {}
+    for clip in model["clips"]:
+        for t in clip["tracks"]:
+            out.setdefault((t["node"], t["path"], t["index"]), []).extend((f, v) for f, v in t["keys"])
+    for k in out:
+        out[k].sort(key=lambda fv: fv[0])
+    return out
+
+
+def _sample(keys, frame: float) -> float:
+    if frame <= keys[0][0]:
+        return keys[0][1]
+    if frame >= keys[-1][0]:
+        return keys[-1][1]
+    for (f0, v0), (f1, v1) in zip(keys, keys[1:]):
+        if f0 <= frame <= f1:
+            if f1 == f0:
+                return v1
+            t = (frame - f0) / (f1 - f0)
+            t = t * t * (3 - 2 * t)
+            return v0 + (v1 - v0) * t
+    return keys[-1][1]
+
+
+def evaluate_pose(model: dict, frame: float, curves=None):
+    """World transform of every node at `frame`: name -> (a, b, c, d, tx, ty, tz).
+
+    X' = a*x + b*z + tx, Z' = c*x + d*z + tz, Y (depth) is just translated.
+    Rotation is about the Y axis (the camera's view axis), as in Blender.
+    """
+    curves = curves if curves is not None else _curves(model)
+    world: Dict[str, tuple] = {}
+    for n in model["nodes"]:
+        name = n["name"]
+        loc = list(n["location"])
+        sx = sy = sz = 1.0
+        rot = 0.0
+        for (cn, path, idx), keys in curves.items():
+            if cn != name:
+                continue
+            v = _sample(keys, frame)
+            if path == "location":
+                loc[idx] = v
+            elif path == "scale":
+                if idx == 0:
+                    sx = v
+                elif idx == 2:
+                    sz = v
+            elif path == "rotation_euler" and idx == 1:
+                rot = v
+        c, s_ = math.cos(rot), math.sin(rot)
+        a, b, cc, d = c * sx, s_ * sz, -s_ * sx, c * sz
+        if n["parent"] is None:
+            world[name] = (a, b, cc, d, loc[0], loc[1], loc[2])
+        else:
+            pa, pb, pc, pd, ptx, pty, ptz = world[n["parent"]]
+            world[name] = (pa * a + pb * cc, pa * b + pb * d, pc * a + pd * cc, pc * b + pd * d,
+                           pa * loc[0] + pb * loc[2] + ptx, pty + loc[1], pc * loc[0] + pd * loc[2] + ptz)
+    return world
+
+
+def render_frame(model: dict, world: dict, px: int, bg: Tuple[int, int, int], supersample: int = 2):
+    """Rasterise one pose with Pillow, painter's algorithm by depth (larger Y = further away)."""
+    from PIL import Image, ImageDraw
+    W = px * supersample
+    img = Image.new("RGB", (W, W), bg)
+    scale = W / (model["size"] * 1.15)            # matches the orthographic camera in the .blend
+    gps = [n for n in model["nodes"] if n["kind"] == "gp"]
+    for n in sorted(gps, key=lambda n: -world[n["name"]][5]):   # stable: ties keep paint order
+        a, b, c, d, tx, _, tz = world[n["name"]]
+        for st in n["strokes"]:
+            pts = [((a * x + b * z + tx) * scale + W / 2, W / 2 - (c * x + d * z + tz) * scale)
+                   for x, _, z in st["points"]]
+            x0, y0 = max(0, int(min(p[0] for p in pts)) - 1), max(0, int(min(p[1] for p in pts)) - 1)
+            x1, y1 = min(W, int(max(p[0] for p in pts)) + 2), min(W, int(max(p[1] for p in pts)) + 2)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            mask = Image.new("L", (x1 - x0, y1 - y0), 0)
+            ImageDraw.Draw(mask).polygon([(x - x0, y - y0) for x, y in pts], fill=round(255 * st["alpha"]))
+            img.paste(hex_rgb(st["color"]), (x0, y0), mask)
+    return img.resize((px, px), Image.LANCZOS) if supersample > 1 else img
+
+
+def write_gif(model: dict, path: Path, px: int = 320, fps: int = 24, bg: str = "#ffffff") -> int:
+    """Write the whole timeline as a looping GIF. Returns the number of frames."""
+    curves = _curves(model)
+    last = max([c["end"] for c in model["clips"]] + [1])
+    frames = [render_frame(model, evaluate_pose(model, f, curves), px, hex_rgb(bg))
+              .convert("P", palette=1, colors=128)       # 1 == Image.ADAPTIVE
+              for f in range(1, last + 1)]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=round(1000 / fps), loop=0,
+                   disposal=2)
+    return len(frames)
 
 
 # ---------------------------------------------------------------------------
@@ -1070,18 +1917,18 @@ def _build_emoji_in_blender(bpy, model: dict, out_path: str):
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     name = model["name"]
+    size = model["size"]
+    collection = bpy.data.collections.new(name)
+    scene.collection.children.link(collection)
 
     # 4.3-4.5 expose the new data model as bpy.data.grease_pencils_v3; from 5.0
     # on it is simply bpy.data.grease_pencils.
     gp_collection = getattr(bpy.data, "grease_pencils_v3", None) or bpy.data.grease_pencils
-    gp = gp_collection.new(name)
-    obj = bpy.data.objects.new(name, gp)
-    scene.collection.objects.link(obj)
 
-    # Materials: one per distinct colour+alpha, fill only (these are flat fills).
-    materials: Dict[Tuple[str, float], int] = {}
+    # Materials are shared by every part: one per distinct colour+alpha.
+    materials: Dict[Tuple[str, float], object] = {}
 
-    def material_index(color: str, alpha: float) -> int:
+    def get_material(color: str, alpha: float):
         key = (color, round(alpha, 3))
         if key in materials:
             return materials[key]
@@ -1099,23 +1946,26 @@ def _build_emoji_in_blender(bpy, model: dict, out_path: str):
             warnings.simplefilter("ignore")
             style.show_fill = True
             style.show_stroke = False
-        gp.materials.append(mat)
-        materials[key] = len(gp.materials) - 1
-        return materials[key]
+        materials[key] = mat
+        return mat
 
-    for layer_def in model["layers"]:
-        layer = gp.layers.new(layer_def["name"])
-        origin = tuple(layer_def["origin"])
-        if hasattr(layer, "translation"):
-            layer.translation = origin
-        else:  # Blender 4.3 naming
-            layer.location = origin
-        drawing = layer.frames.new(1).drawing
-        strokes = layer_def["strokes"]
+    def build_gp(node: dict):
+        gp = gp_collection.new(node["name"])
+        slots: Dict[int, int] = {}
+
+        def slot_for(color: str, alpha: float) -> int:
+            mat = get_material(color, alpha)
+            if id(mat) not in slots:
+                gp.materials.append(mat)
+                slots[id(mat)] = len(gp.materials) - 1
+            return slots[id(mat)]
+
+        drawing = gp.layers.new("fill").frames.new(1).drawing
+        strokes = node["strokes"]
         drawing.add_strokes([len(s["points"]) for s in strokes])
         for gp_stroke, sd in zip(drawing.strokes, strokes):
             gp_stroke.cyclic = True
-            gp_stroke.material_index = material_index(sd["color"], sd["alpha"])
+            gp_stroke.material_index = slot_for(sd["color"], sd["alpha"])
             for pt, co in zip(gp_stroke.points, sd["points"]):
                 pt.position = co
                 pt.radius = 0.002
@@ -1134,17 +1984,46 @@ def _build_emoji_in_blender(bpy, model: dict, out_path: str):
                 attr.data.foreach_set("value", values)
             except Exception as exc:  # older 4.x builds: the material flags above do the job
                 print(f"[blender.py] note: could not set {attr_name}: {exc}", flush=True)
+        return gp
+
+    # One object per part, parented parents-first; `location` is relative to the parent.
+    objs: Dict[str, object] = {}
+    for node in model["nodes"]:
+        if node["kind"] == "gp":
+            ob = bpy.data.objects.new(node["name"], build_gp(node))
+        else:
+            ob = bpy.data.objects.new(node["name"], None)
+            ob.empty_display_type = "PLAIN_AXES"
+            ob.empty_display_size = size * 0.04
+        ob.location = node["location"]
+        ob["part"] = node["part"]
+        collection.objects.link(ob)
+        if node["parent"]:
+            ob.parent = objs[node["parent"]]
+        objs[node["name"]] = ob
+    root = objs[name]
+
+    # Animation: every clip is keyframed on one timeline, with a marker at its start.
+    scene.render.fps = model.get("fps", 24)
+    for clip in model["clips"]:
+        for track in clip["tracks"]:
+            ob = objs[track["node"]]
+            for frame, value in track["keys"]:
+                getattr(ob, track["path"])[track["index"]] = value
+                ob.keyframe_insert(data_path=track["path"], index=track["index"], frame=frame)
+        scene.timeline_markers.new(clip["name"], frame=clip["start"])
+    scene.frame_start = 1
+    scene.frame_end = max([c["end"] for c in model["clips"]] + [1])
+    scene.frame_set(1)
 
     # Keep the face map with the data so animation scripts can find the parts.
-    facemap_json = json.dumps(model["facemap"])
-    obj["emoji_code"] = model["code"]
-    obj["face_map"] = facemap_json
-    gp["face_map"] = facemap_json
+    root["emoji_code"] = model["code"]
+    root["face_map"] = json.dumps(model["facemap"])
 
     # Front-view orthographic camera + colours that match the SVG hex values.
     cam_data = bpy.data.cameras.new("Camera")
     cam_data.type = "ORTHO"
-    cam_data.ortho_scale = model["size"] * 1.15
+    cam_data.ortho_scale = size * 1.15
     cam = bpy.data.objects.new("Camera", cam_data)
     cam.location = (0.0, -10.0, 0.0)
     cam.rotation_euler = (_m.radians(90), 0.0, 0.0)
@@ -1155,8 +2034,8 @@ def _build_emoji_in_blender(bpy, model: dict, out_path: str):
     scene.render.image_settings.color_mode = "RGBA"
     scene.view_settings.view_transform = "Standard"
 
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
+    bpy.context.view_layer.objects.active = root
+    root.select_set(True)
 
     bpy.ops.wm.save_as_mainfile(filepath=out_path, compress=True)
 
@@ -1252,8 +2131,13 @@ def load_emoji_tables():
     return by_short, short_of
 
 
-def resolve_codes(spec: str, by_short: Dict[str, str]) -> List[str]:
-    if spec.strip().lower() == "all":
+def resolve_codes(spec: str, by_short: Dict[str, str], experimental: bool = False) -> List[str]:
+    """'faces' = every supported face; 'all' = every SVG with --experimental,
+    otherwise the same as 'faces'."""
+    keyword = spec.strip().lower()
+    if keyword == "faces" or (keyword == "all" and not experimental):
+        return list(FACES)
+    if keyword == "all":
         return [p.stem for p in sorted(SVG_DIR.glob("*.svg"))]
     codes: List[str] = []
     for tok in (t.strip() for t in spec.split(",")):
@@ -1300,53 +2184,99 @@ def run_blender(exe: str, job_path: Path, result_path: Path, verbose: bool) -> i
 def host_main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Export Twemoji SVGs to Blender Grease Pencil with face-part tagging.")
-    ap.add_argument("--emojis", required=True,
-                    help="comma-separated shortnames (joy), unicode codes (1f602), a mix, or 'all'")
+    ap.add_argument("--emojis",
+                    help="comma-separated shortnames (joy), unicode codes (1f602), a mix, or 'faces' "
+                         "for every supported face")
+    ap.add_argument("--list-faces", action="store_true", help="list the supported faces and their animations, then exit")
+    ap.add_argument("--experimental", action="store_true",
+                    help="also export emoji that have no entry in FACES, using auto-detection and generic "
+                         "animations (non-faces are skipped; with this flag 'all' means every SVG)")
     ap.add_argument("--output", default="./output/blender", help="output directory (default: ./output/blender)")
     ap.add_argument("--naming", choices=["unicode", "shortname"], default="unicode")
     ap.add_argument("--blender", help="path to the Blender executable (default: $BLENDER, then PATH, then common locations)")
     ap.add_argument("--size", type=float, default=2.0, help="emoji size in Blender units (default: 2.0)")
-    ap.add_argument("--curve-segments", type=int, default=8,
-                    help="line segments per curve (default: 8, same as the TS CLI)")
+    ap.add_argument("--skin", choices=SKIN_STYLES, default="zombie",
+                    help="head skin: 'zombie' (default) replaces the yellow head with green zombie skin; "
+                         "'none' keeps the original colours")
+    ap.add_argument("--curve-segments", type=int, default=16,
+                    help="line segments per curve (default: 16; the TS CLI uses 8)")
     ap.add_argument("--facemap-only", action="store_true",
                     help="only write the face-map JSON (and debug SVG); do not run Blender")
+    ap.add_argument("--gif", action="store_true",
+                    help="also write <name>.gif, a preview of every animation clip played in a row "
+                         "(needs Pillow, no Blender)")
+    ap.add_argument("--gif-size", type=int, default=320, help="GIF width/height in pixels (default: 320)")
+    ap.add_argument("--gif-fps", type=int, default=24, help="GIF frame rate (default: 24)")
+    ap.add_argument("--gif-background", default="#ffffff", help="GIF background colour (default: #ffffff)")
     ap.add_argument("--debug-svg", action="store_true", help="also write <name>.facemap.svg showing the labelled shapes")
     ap.add_argument("--verbose", action="store_true", help="show all Blender output")
     args = ap.parse_args(argv)
 
     by_short, short_of = load_emoji_tables()
-    codes = resolve_codes(args.emojis, by_short)
+    if args.list_faces:
+        for code, spec in FACES.items():
+            print(f"{code:<8} {short_of.get(code, ''):<28} {spec.title:<36} {', '.join(spec.animations)}")
+        return 0
+    if not args.emojis:
+        ap.error("--emojis is required (or use --list-faces)")
+    codes = resolve_codes(args.emojis, by_short, args.experimental)
     out_dir = Path(args.output).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    models, failures = [], []
+    models, failures, unsupported, not_faces = [], [], [], []
     n_face = 0
     for code in codes:
         name = short_of.get(code, code) if args.naming == "shortname" else code
+        if code not in FACES and not args.experimental:
+            unsupported.append(code)
+            continue
         try:
-            model, parsed = build_model(code, name, SVG_DIR / f"{code}.svg", args.size, args.curve_segments)
+            model, parsed = build_model(code, name, SVG_DIR / f"{code}.svg", args.size, args.curve_segments,
+                                         skin=args.skin)
         except Exception as exc:
             failures.append((code, f"{type(exc).__name__}: {exc}"))
             continue
         fm = model["facemap"]
+        if not fm["supported"] and not fm["is_face"]:
+            not_faces.append(code)
+            continue
         n_face += fm["is_face"]
         (out_dir / f"{name}.facemap.json").write_text(json.dumps(fm, indent=2), encoding="utf-8")
         if args.debug_svg:
             write_debug_svg(out_dir / f"{name}.facemap.svg", parsed)
         models.append(model)
         if len(codes) <= 20:
-            parts = ", ".join(fm["parts"]) if fm["is_face"] else "(not a face)"
-            print(f"{code:<24} {parts}")
+            anims = ", ".join(a["name"] for a in fm["animations"]) or "none"
+            print(f"{code:<8} {fm['title']:<34} parts: {', '.join(fm['parts'])}\n{'':<8} animations: {anims}")
             for w in fm["warnings"]:
                 print(f"    warning: {w}")
 
-    print(f"Parsed {len(models)}/{len(codes)} emoji, {n_face} detected as faces.")
+    print(f"Parsed {len(models)}/{len(codes)} emoji.")
+    if unsupported:
+        shown = ", ".join(unsupported[:12]) + (" ..." if len(unsupported) > 12 else "")
+        print(f"Skipped {len(unsupported)} emoji with no entry in FACES yet: {shown}\n"
+              f"  (add one in blender.py, or pass --experimental to use auto-detection)", file=sys.stderr)
+    if not_faces:
+        print(f"Skipped {len(not_faces)} emoji that are not faces.")
     for code, err in failures:
         print(f"  FAILED {code}: {err}", file=sys.stderr)
 
+    if args.gif and models:
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            print("--gif needs Pillow: pip install pillow", file=sys.stderr)
+            return 2
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", args.gif_background):
+            ap.error("--gif-background must look like #rrggbb")
+        for m in models:
+            n = write_gif(m, out_dir / f"{m['name']}.gif", args.gif_size, args.gif_fps, args.gif_background)
+            print(f"  {m['name']}.gif  ({n} frames)")
+        print(f"Wrote {len(models)} GIF(s) to {out_dir}")
+
     if args.facemap_only or not models:
         print(f"Wrote face maps to {out_dir}")
-        return 1 if failures else 0
+        return 1 if failures or (unsupported and not models) else 0
 
     exe = find_blender(args.blender)
     if exe is None:
