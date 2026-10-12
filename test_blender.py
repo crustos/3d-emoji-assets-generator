@@ -215,7 +215,7 @@ class Rig(unittest.TestCase):
         # 🤔: the hand is drawn after (on top of) the mouth.
         m = model_for("1f914")
         y = {n["part"]: n["world"][1] for n in m["nodes"] if n["kind"] == "gp"}
-        self.assertLess(y["other_02"], y["mouth"])
+        self.assertLess(y["hand"], y["mouth"])
         self.assertEqual(m["facemap"]["warnings"], [])
 
     def test_size_is_respected(self):
@@ -269,7 +269,7 @@ class Registry(unittest.TestCase):
         self.assertTrue(any("brow_raise" in w for w in m["facemap"]["warnings"]))
 
     def test_unlisted_emoji_get_a_generic_spec(self):
-        m = model_for("1f60e")      # sunglasses: not in FACES
+        m = model_for("1f921")      # clown: not in FACES
         self.assertFalse(m["facemap"]["supported"])
 
 
@@ -286,7 +286,10 @@ class Clips(unittest.TestCase):
                     self.assertEqual(frames, sorted(frames))
                     self.assertEqual(frames[0], c["start"])
                     self.assertEqual(frames[-1], c["end"])
-                    self.assertAlmostEqual(t["keys"][0][1], t["keys"][-1][1], msg=f"{code} {c['name']}")
+                    end = t["keys"][-1][1] - t["keys"][0][1]
+                    if t["path"] == "rotation_euler":                       # a full turn is back at rest
+                        end = (end + math.pi) % math.tau - math.pi
+                    self.assertAlmostEqual(end, 0.0, msg=f"{code} {c['name']}")
 
     def test_every_clip_actually_moves_something(self):
         for code in B.FACES:
@@ -439,10 +442,117 @@ class NewFaces(unittest.TestCase):
         self.assertTrue(model_for("2620")["facemap"]["complete"])
 
 
+class MoreFaces(unittest.TestCase):
+    def test_sunglasses_have_no_eyes_but_still_look_around(self):
+        m = model_for("1f60e")
+        parts = m["facemap"]["parts"]
+        self.assertIn("glasses", parts)
+        self.assertFalse([p for p in parts if p.startswith("eye_")])
+        self.assertTrue(m["facemap"]["complete"])
+        names = [c["name"] for c in m["clips"]]
+        self.assertIn("look_around", names)
+        self.assertNotIn("eye_dart", names)
+
+    def test_smirk_raises_one_brow(self):
+        m = model_for("1f60f")
+        clip = next(c for c in m["clips"] if c["name"] == "brow_raise")
+        self.assertEqual({t["node"] for t in clip["tracks"]}, {"1f60f.brow_right"})
+
+    def test_sleeping_zs_and_shadows(self):
+        m = model_for("1f634")
+        for i in (1, 2, 3):
+            self.assertEqual(node(m, f"zzz_shadow_{i}")["parent"], f"1f634.zzz_{i}")
+            self.assertEqual(node(m, f"zzz_{i}")["parent"], "1f634")
+        clip = next(c for c in m["clips"] if c["name"] == "zzz")
+        self.assertEqual({t["node"] for t in clip["tracks"]}, {f"1f634.zzz_{i}" for i in (1, 2, 3)})
+
+    def test_dizzy_eyes_spin_a_full_turn(self):
+        m = model_for("1f635")
+        clip = next(c for c in m["clips"] if c["name"] == "eye_spin")
+        for t in clip["tracks"]:
+            self.assertAlmostEqual(t["keys"][-1][1] - t["keys"][0][1], math.tau)
+
+    def test_thinking_face_hand_is_not_the_mouth(self):
+        m = model_for("1f914")
+        parts = m["facemap"]["parts"]
+        self.assertEqual(parts["hand"]["colors"], ["#f19020"])
+        self.assertEqual(parts["mouth"]["colors"], ["#65471b"])
+        self.assertEqual(parts["brow_left"]["rule"], "spec-rule")
+        clip = next(c for c in m["clips"] if c["name"] == "chin_tap")
+        self.assertTrue(all(t["node"] == "1f914.hand" for t in clip["tracks"]))
+
+    def test_hearts_pulse_and_scream_hands_exist(self):
+        m = model_for("1f970")
+        for i in (1, 2, 3):
+            self.assertEqual(node(m, f"heart_shadow_{i}")["parent"], f"1f970.heart_{i}")
+        self.assertTrue({"hand_left", "hand_right", "pallor"} <= set(model_for("1f631")["facemap"]["parts"]))
+
+    def test_wound_stays_clear_of_where_eyes_sit(self):
+        for code in ("1f600", "1f612", "1f914", "1f92a"):
+            m = model_for(code, skin="zombie")
+            w = next(n for n in m["nodes"] if n["part"] == "wound_rim")
+            xs = [x + w["world"][0] for st in w["strokes"] for x, _, _ in st["points"]]
+            self.assertGreater(min(abs(x) for x in xs), 0.5, code)
+
+
+class MoreFaces2(unittest.TestCase):
+    def test_kiss_winks_with_the_right_eye_and_sends_a_heart(self):
+        m = model_for("1f618")
+        blink = next(c for c in m["clips"] if c["name"] == "blink")
+        self.assertEqual({t["node"] for t in blink["tracks"]}, {"1f618.eye_left"})
+        self.assertEqual(node(m, "heart_shadow_1")["parent"], "1f618.heart_1")
+
+    def test_yum_has_a_tongue_with_a_crease(self):
+        m = model_for("1f60b")
+        self.assertEqual(node(m, "tongue_detail")["parent"], "1f60b.tongue")
+        self.assertEqual(node(m, "tongue")["parent"], "1f60b.mouth")
+
+    def test_shushing_finger_is_the_hand_not_the_mouth(self):
+        m = model_for("1f92b")
+        parts = m["facemap"]["parts"]
+        self.assertEqual(parts["hand"]["colors"], ["#f19020"])
+        self.assertEqual(parts["mouth"]["colors"], ["#65471b"])
+        self.assertEqual(node(m, "hand_detail_1")["parent"], "1f92b.hand")
+        self.assertEqual(m["facemap"]["warnings"], [])
+
+    def test_nauseated_cheeks_puff_out_of_step(self):
+        m = model_for("1f922")
+        clip = next(c for c in m["clips"] if c["name"] == "puff")
+        peaks = {t["node"]: max(t["keys"], key=lambda k: k[1])[0] for t in clip["tracks"]}
+        self.assertNotEqual(peaks["1f922.cheek_left"], peaks["1f922.cheek_right"])
+
+    def test_cold_face_icicles_are_four_tears_and_all_drip(self):
+        m = model_for("1f976")
+        self.assertEqual(len([p for p in m["facemap"]["parts"] if p.startswith("tear_")]), 4)
+        clip = next(c for c in m["clips"] if c["name"] == "tear_drip")
+        self.assertEqual(len({t["node"] for t in clip["tracks"]}), 4)
+        self.assertEqual(m["facemap"]["warnings"], [])
+
+    def test_yawn_opens_the_dark_mouth_and_squints(self):
+        m = model_for("1f971")
+        parts = m["facemap"]["parts"]
+        self.assertEqual(parts["mouth"]["colors"], ["#664500"])
+        self.assertEqual(parts["hand"]["colors"], ["#f4900c"])
+        clip = next(c for c in m["clips"] if c["name"] == "yawn")
+        w = B.evaluate_pose(m, (clip["start"] + clip["end"]) // 2)
+        self.assertGreater(w["1f971.mouth"][0], 1.2)
+        self.assertLess(w["1f971.eye_left"][3], 0.6)
+
+    def test_face_without_a_mouth_is_still_complete(self):
+        m = model_for("1f636")
+        self.assertNotIn("mouth", m["facemap"]["parts"])
+        self.assertTrue(m["facemap"]["complete"])
+
+    def test_pale_forehead_patch_is_named_on_the_scared_faces(self):
+        for code in ("1f628", "1f630", "1f631"):
+            self.assertIn("pallor", model_for(code)["facemap"]["parts"], code)
+
+
 class IdleAnimation(unittest.TestCase):
     def test_every_supported_face_has_the_idle_clips(self):
         for code, spec in B.FACES.items():
-            for a in B.IDLE_CLIPS:
+            self.assertIn("tilt", spec.animations, code)                  # every face tilts
+            for a in spec.idle:
                 self.assertIn(a, spec.animations, code)
 
     def test_look_around_looks_both_ways_features_lead_the_skull(self):
@@ -530,7 +640,7 @@ class GifExport(unittest.TestCase):
         from PIL import Image
         m = model_for("1f602", skin="zombie")
         with tempfile.TemporaryDirectory() as d:
-            n = B.write_gif(m, Path(d) / "x.gif", px=96)
+            n = B.write_gif(m, Path(d) / "x.gif", px=96, fps=24)
             self.assertEqual(n, max(c["end"] for c in m["clips"]))
             g = Image.open(Path(d) / "x.gif")
             self.assertEqual(g.size, (96, 96))
@@ -540,6 +650,13 @@ class GifExport(unittest.TestCase):
                 g.seek(i)
                 total += g.info["duration"]
             self.assertGreaterEqual(total, n * 30)
+
+    def test_gif_samples_the_timeline_at_the_requested_fps(self):
+        m = model_for("1f600", skin="none")
+        last = max(c["end"] for c in m["clips"])
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(B.write_gif(m, Path(d) / "a.gif", px=48), len(range(1, last + 1, 3)))   # default 8 fps
+            self.assertEqual(B.write_gif(m, Path(d) / "b.gif", px=48, fps=24), last)
 
     def test_frames_differ_during_a_clip_and_background_is_applied(self):
         from PIL import ImageChops
@@ -578,14 +695,14 @@ class Cli(unittest.TestCase):
 
     def test_unsupported_emoji_are_refused_without_experimental(self):
         with tempfile.TemporaryDirectory() as t:
-            self.assertEqual(B.host_main(["--emojis", "1f60e", "--output", t, "--facemap-only"]), 1)
+            self.assertEqual(B.host_main(["--emojis", "1f921", "--output", t, "--facemap-only"]), 1)
             self.assertEqual(list(Path(t).glob("*.json")), [])
 
     def test_experimental_exports_detected_faces_and_skips_non_faces(self):
         with tempfile.TemporaryDirectory() as t:
-            rc = B.host_main(["--emojis", "1f60e,1f680,1f618", "--output", t, "--facemap-only", "--experimental"])
+            rc = B.host_main(["--emojis", "1f921,1f680", "--output", t, "--facemap-only", "--experimental"])
             self.assertEqual(rc, 0)
-            self.assertTrue((Path(t) / "1f618.facemap.json").exists())
+            self.assertTrue((Path(t) / "1f921.facemap.json").exists())
             self.assertFalse((Path(t) / "1f680.facemap.json").exists())      # a rocket is not a face
 
     def test_faces_keyword_writes_every_supported_face(self):

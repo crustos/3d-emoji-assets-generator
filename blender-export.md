@@ -45,7 +45,7 @@ Only faces are targeted. Emoji not in the `FACES` registry are skipped (with a m
 | `--size` | `2.0` | emoji size in Blender units |
 | `--skin` | `zombie` | `zombie` replaces the head with generated zombie flesh layers, `none` keeps the original disc |
 | `--gif` | off | also write `<name>.gif`: every animation clip played in a row (needs Pillow, no Blender) |
-| `--gif-size` / `--gif-fps` / `--gif-background` | `320` / `24` / `#ffffff` | GIF pixels, frame rate and background colour |
+| `--gif-size` / `--gif-fps` / `--gif-background` | `320` / `8` / `#ffffff` | GIF pixels, frame rate and background colour |
 | `--curve-segments` | `16` | line segments per Bezier curve |
 | `--blender` | auto | path to the Blender executable |
 | `--facemap-only` | off | write the face-map JSON only, skip Blender |
@@ -54,11 +54,11 @@ Only faces are targeted. Emoji not in the `FACES` registry are skipped (with a m
 
 ## Supported faces
 
-`python3 blender.py --list-faces` prints them. Besides the grinning/laughing/crying set: 🤪 😬 😷 🤯 🤓 🥺 🥹 ☠️ and 🙄 (the one used in the demo below). The newer entries rely on `rules` to name shapes auto-detection has no label for (`tongue`, `mask`, `glasses`, `smoke`, `flame_*`, `eyewhite_*`, `bone_*`, `nose`, ...). ☠️ is not a face but has eyes, so it is supported without a zombie head (`zombie_head=False`).
+`python3 blender.py --list-faces` prints them. Besides the grinning/laughing/crying set: 🤪 😬 😷 🤯 🤓 🥺 🥹 ☠️ 🙄 😎 😏 😒 😔 😕 😠 😴 😵 😱 🤔 🥰 😘 😋 🤩 🤫 🤢 🥵 🥶 🥱 🙂 😶 😑 😨 😰 (the demo below is 🤪). The newer entries rely on `rules` to name shapes auto-detection has no label for (`tongue`, `mask`, `glasses`, `smoke`, `flame_*`, `eyewhite_*`, `bone_*`, `nose`, ...). ☠️ is not a face but has eyes, so it is supported without a zombie head (`zombie_head=False`).
 
-![rolling eyes](demo/rolling_eyes.gif)
+![zany face](demo/zany_face.gif)
 
-*`python3 blender.py --emojis rolling_eyes --gif --facemap-only`*
+*`python3 blender.py --emojis zany_face --gif --facemap-only`*
 
 ## The `FACES` registry
 
@@ -71,6 +71,8 @@ Each supported face has an entry in `FACES` (top of the rig section of `blender.
     pivots={}, params={"talk": {"gain": 1.5}})
 ```
 
+- `mouthless`: `True` for a face with no mouth (😶), so it still counts as `complete`.
+- `idle`: which of the idle clips to append (default all three; sunglasses have no eyes to dart, a sleeping face only tilts).
 - `zombie_head`: set `False` when `face` is not a head to replace (the skull).
 - `rules`: relabel a shape by SVG position (and optionally colour) when auto-detection gets it wrong or has no name for it. A rule that matches nothing prints a warning.
 - `pivots`: where each part rotates/scales from. A mode (`center`, `top`, `bottom`, `inner`, `outer`, `left`, `right`) or an `(dx, dy)` offset in SVG units from the part centre. Defaults: brows `inner`, mouth/tongue/tears `top`.
@@ -118,7 +120,7 @@ Clips are ordinary keyframes on one timeline (24 fps, 6-frame gaps) with a **tim
 |------|-----------|
 | `blink` | eyes squash (`targets` param picks which) |
 | `talk` | mouth opens/closes, kept inside the face (`gain`) |
-| `brow_raise` | brows lift |
+| `brow_raise` | brows lift (`targets` param: e.g. only the right brow for 😏 🤔) |
 | `look` | pupils (or eyes) look left, right and down; this is the rolling-eyes clip |
 | `pulse` | eyes pulse (heart eyes) |
 | `tear_drip` / `tear_well` | tears stretch down from the top / well up from the bottom |
@@ -133,6 +135,13 @@ Clips are ordinary keyframes on one timeline (24 fps, 6-frame gaps) with a **tim
 | `explode` | smoke and flames puff up (🤯) |
 | `shake` / `rattle` | the whole head shakes sideways / rattles (🤯, ☠️) |
 | `glasses_push` | glasses lift and tilt (🤓) |
+| `zzz` | the snore Zs bob up one after another (😴) |
+| `eye_spin` | crossed-out eyes spin a full turn (😵) |
+| `chin_tap` | the hand taps the chin (🤔) |
+| `heartbeat` | the hearts pulse one after another (🥰) |
+| `shush` | the finger sways (🤫) |
+| `puff` | the cheeks swell, out of step (🤢) |
+| `yawn` | mouth opens wide, eyes squeeze shut, hand lifts (🥱) |
 | `shimmer` | eye highlights twinkle (🥺 🥹) |
 | `quiver` | the lip trembles (🥺) |
 
@@ -168,7 +177,7 @@ pip install pillow
 python3 blender.py --emojis joy,1f633 --gif --facemap-only --output ./output/blender/
 ```
 
-`--gif` writes `<name>.gif` with all the clips played one after another (looping). It replays the same node tree and keyframes that go into the `.blend`, rasterised with Pillow, so it needs neither Blender nor a GPU (add `--facemap-only` to skip the `.blend`). Keyframes are eased with a smoothstep, close to Blender's default interpolation, but it is a preview rather than a Blender render. GIFs are ~0.5-1.3 MB at the default size.
+`--gif` writes `<name>.gif` with all the clips played one after another (looping). It replays the same node tree and keyframes that go into the `.blend`, rasterised with Pillow, so it needs neither Blender nor a GPU (add `--facemap-only` to skip the `.blend`). Keyframes are eased with a smoothstep, close to Blender's default interpolation, but it is a preview rather than a Blender render. The 24 fps timeline is sampled down to 8 fps by default (`--gif-fps`), which keeps GIFs around 1 MB.
 
 ## Animating the parts
 

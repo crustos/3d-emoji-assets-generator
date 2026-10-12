@@ -976,6 +976,9 @@ class Rule:
     color: Optional[str] = None      # ... and, if given, has exactly this '#rrggbb' fill
 
 
+IDLE_CLIPS = ("look_around", "eye_dart", "tilt")
+
+
 @dataclass(frozen=True)
 class FaceSpec:
     title: str
@@ -986,6 +989,8 @@ class FaceSpec:
     pivots: Dict[str, object] = field(default_factory=dict)
     params: Dict[str, dict] = field(default_factory=dict)
     zombie_head: bool = True         # False when the "face" shape is not a head to replace (the skull)
+    mouthless: bool = False          # a face with no mouth at all (😶) still counts as complete
+    idle: Tuple[str, ...] = IDLE_CLIPS   # clips appended to every face; drop the ones that make no sense
 
 
 FACES: Dict[str, FaceSpec] = {
@@ -1040,6 +1045,81 @@ FACES: Dict[str, FaceSpec] = {
                              Rule("eyewhite_left", near=(11.5, 17.5), radius=1.2, color="#ffffff"),
                              Rule("eyewhite_right", near=(24.5, 17.5), radius=1.2, color="#ffffff")),
                       pivots={"tear_left": "bottom", "tear_right": "bottom"}),
+    "1f60e": FaceSpec("smiling face with sunglasses", ("glasses_push", "talk", "bounce"),
+                      rules=(Rule("glasses", near=(18, 14.2), radius=2.0, color="#292f33"),),
+                      idle=("look_around", "tilt")),                                # no visible eyes
+    "1f60f": FaceSpec("smirking face", ("blink", "brow_raise", "talk"),
+                      params={"brow_raise": {"targets": ("brow_right",)}}),         # one raised brow
+    "1f612": FaceSpec("unamused face", ("blink", "look", "brow_raise", "talk"),
+                      rules=(Rule("brow_left", near=(11, 12), radius=1.5, color="#664500"),
+                             Rule("brow_right", near=(25, 12), radius=1.5, color="#664500"))),
+    "1f614": FaceSpec("pensive face", ("blink", "brow_raise", "talk")),
+    "1f615": FaceSpec("confused face", ("blink", "look", "talk")),
+    "1f620": FaceSpec("angry face", ("talk", "shake")),                             # brows are merged into the eyes
+    "1f634": FaceSpec("sleeping face", ("breathe", "zzz"), idle=("tilt",),
+                      rules=(Rule("zzz_shadow_1", near=(15.3, 7.7), radius=1.5, color="#ffac33"),
+                             Rule("zzz_1", near=(15.9, 7.3), radius=1.5, color="#2a6797"),
+                             Rule("zzz_shadow_2", near=(22.0, 4.3), radius=1.5, color="#ffac33"),
+                             Rule("zzz_2", near=(22.8, 3.9), radius=1.5, color="#2a6797"),
+                             Rule("zzz_shadow_3", near=(30.6, 8.2), radius=1.5, color="#ffac33"),
+                             Rule("zzz_3", near=(31.6, 7.7), radius=1.5, color="#2a6797")),
+                      pivots={"mouth": "center"}, params={"breathe": {"targets": ("mouth",), "amount": 0.18}}),
+    "1f635": FaceSpec("face with crossed-out eyes", ("eye_spin", "brow_raise", "talk"), idle=("look_around", "tilt"),
+                      pivots={"mouth": "center"}),
+    "1f631": FaceSpec("face screaming in fear", ("shake", "pulse", "talk"), idle=("look_around", "tilt"),
+                      rules=(Rule("pallor", near=(18, 10.7), radius=3.0, color="#bdddf4"),
+                             Rule("hand_left", near=(3.8, 27.4), radius=2.0, color="#fcab40"),
+                             Rule("hand_right", near=(32.2, 27.5), radius=2.0, color="#fcab40")),
+                      pivots={"mouth": "center"}),
+    "1f914": FaceSpec("thinking face", ("brow_raise", "look", "chin_tap", "blink", "talk"),
+                      rules=(Rule("mouth", near=(18.5, 20.9), radius=1.5, color="#65471b"),
+                             Rule("hand", near=(15.5, 26.9), radius=9.0, color="#f19020"),
+                             Rule("brow_left", near=(13.2, 5.2), radius=1.5, color="#65471b"),
+                             Rule("brow_right", near=(25.4, 9.4), radius=1.5, color="#65471b")),
+                      pivots={"hand": (-6, 6)}, params={"brow_raise": {"targets": ("brow_right",)}}),
+    "1f970": FaceSpec("smiling face with hearts", ("heartbeat", "talk"),
+                      rules=(Rule("heart_shadow_1", near=(26.5, 5.9), radius=1.5, color="#ffac33"),
+                             Rule("heart_1", near=(28.1, 5.2), radius=1.5, color="#dd2e44"),
+                             Rule("heart_shadow_2", near=(8.0, 29.6), radius=1.5, color="#ffac33"),
+                             Rule("heart_2", near=(6.2, 30.5), radius=1.5, color="#dd2e44"),
+                             Rule("heart_shadow_3", near=(30.2, 27.7), radius=1.5, color="#ffac33"),
+                             Rule("heart_3", near=(31.8, 27.6), radius=1.5, color="#dd2e44"))),
+    "1f618": FaceSpec("face blowing a kiss", ("blink", "brow_raise", "heartbeat", "talk"),
+                      params={"blink": {"targets": ("eye_left",)}},                  # the right eye is the wink
+                      rules=(Rule("heart_shadow_1", near=(28.3, 26.6), radius=1.5, color="#ffac33"),
+                             Rule("heart_1", near=(30.1, 25.9), radius=1.5, color="#dd2e44"))),
+    "1f60b": FaceSpec("face savoring food", ("tongue_wag", "talk"),
+                      rules=(Rule("tongue", near=(28.5, 29.8), radius=2.5, color="#e75b70"),
+                             Rule("tongue_detail", near=(27.9, 29.0), radius=2.0, color="#de3146"))),
+    "1f929": FaceSpec("star-struck", ("pulse", "eye_spin", "talk")),
+    "1f92b": FaceSpec("shushing face", ("brow_raise", "blink", "shush"),
+                      rules=(Rule("mouth", near=(17.8, 23.1), radius=1.5, color="#65471b"),
+                             Rule("hand", near=(19.2, 28.4), radius=3.0, color="#f19020"),
+                             Rule("hand_detail_1", near=(21.1, 28.8), radius=1.5, color="#65471b"),
+                             Rule("hand_detail_2", near=(19.5, 33.2), radius=1.5, color="#65471b")),
+                      pivots={"hand": "bottom"}),
+    "1f922": FaceSpec("nauseated face", ("blink", "puff", "talk"),
+                      rules=(Rule("mouth", near=(17.9, 24.2), radius=1.5, color="#292f33"),
+                             Rule("cheek_left", near=(13.4, 24.4), radius=1.5, color="#3e721d"),
+                             Rule("cheek_right", near=(22.6, 24.4), radius=1.5, color="#3e721d"))),
+    "1f975": FaceSpec("hot face", ("tear_drip", "brow_raise", "blink", "talk")),
+    "1f976": FaceSpec("cold face", ("chatter", "shake", "tear_drip", "blink"),
+                      rules=(Rule("teeth", near=(18, 25.8), radius=1.5, color="#ffffff"),
+                             Rule("tear_left", near=(2.4, 28.3), radius=1.5, color="#bbddf5"),      # the four ice
+                             Rule("tear_right", near=(33.3, 24.1), radius=1.5, color="#bbddf5"),    # shapes are
+                             Rule("tear_top_left", near=(8.3, 12.5), radius=1.5, color="#bbddf5"),  # painted either side
+                             Rule("tear_top_right", near=(21.9, 4.3), radius=1.5, color="#bbddf5"))),   # of the brows
+    "1f971": FaceSpec("yawning face", ("yawn",), idle=("look_around", "tilt"),
+                      rules=(Rule("mouth", near=(18, 19.5), radius=2.0, color="#664500"),
+                             Rule("hand", near=(12.2, 27), radius=6.0, color="#f4900c")),
+                      pivots={"mouth": "center"}),
+    "1f642": FaceSpec("slightly smiling face", ("blink", "talk")),
+    "1f636": FaceSpec("face without mouth", ("blink",), mouthless=True),
+    "1f611": FaceSpec("expressionless face", ("blink", "talk")),
+    "1f628": FaceSpec("fearful face", ("brow_raise", "blink", "shake", "talk"),
+                      rules=(Rule("pallor", near=(18, 8.4), radius=3.0, color="#bdddf4"),)),
+    "1f630": FaceSpec("anxious face with sweat", ("tear_drip", "brow_raise", "blink", "talk"),
+                      rules=(Rule("pallor", near=(18, 8.4), radius=3.0, color="#bdddf4"),)),
     "2620": FaceSpec("skull and crossbones", ("blink", "rattle", "bounce"), zombie_head=False,
                      rules=(Rule("face", near=(18, 18), radius=1.5, color="#ccd6dd"),
                             Rule("eye_left", near=(13.6, 15.5), radius=1.5, color="#292f33"),
@@ -1054,8 +1134,7 @@ FACES: Dict[str, FaceSpec] = {
 
 # Every supported face also gets the idle set: looking left and right (head turn + tilt),
 # eye darts and a slow head tilt.
-IDLE_CLIPS = ("look_around", "eye_dart", "tilt")
-FACES = {c: replace(sp, animations=sp.animations + tuple(a for a in IDLE_CLIPS if a not in sp.animations))
+FACES = {c: replace(sp, animations=sp.animations + tuple(a for a in sp.idle if a not in sp.animations))
          for c, sp in FACES.items()}
 
 
@@ -1137,6 +1216,10 @@ def _parent_key(part: str, present) -> str:
         cand = "mouth"
     elif part == "tongue_detail":
         cand = "tongue"
+    elif part.startswith(("zzz_shadow_", "heart_shadow_")):
+        cand = part.replace("_shadow", "")                      # a shadow follows its Z / heart
+    elif part.startswith("hand_detail"):
+        cand = "hand"
     elif part.startswith(("smoke", "flame")):
         cand = "explosion"
     elif part.startswith("tear_") and part != "tear_pool":
@@ -1171,7 +1254,8 @@ def build_rig(name: str, layer_list, spec: FaceSpec, vb, size: float):
     present = set(parts)
     nodes: Dict[str, dict] = {"root": {"key": "root", "kind": "empty", "parent": "root-none", "world": [0.0, 0.0, 0.0]}}
     for key, p in parts.items():
-        mode = spec.pivots.get(key, DEFAULT_PIVOTS.get(key, "center"))
+        default = "top" if key.startswith("tear_") and key != "tear_pool" else DEFAULT_PIVOTS.get(key, "center")
+        mode = spec.pivots.get(key, default)
         px, pz = _pivot_point(p["bbox"], mode, s)
         nodes[key] = {"key": key, "kind": "gp", "parent": _parent_key(key, present),
                       "world": [px, -rank[key] * DEPTH_STEP * size, pz], "data": p}
@@ -1342,9 +1426,9 @@ def zombie_head_layers(code: str, radius: float):
             x, z = nx, nz
     bruise_side = rng.choice((-1, 1))
     out["bruise"].append(clamp(_blob(rng, bruise_side * R * 0.5, -R * 0.3, R * 0.2, wobble=0.25)))
-    wx, wz = -bruise_side * R * 0.52, R * 0.05            # torn-open cheek on the other side
-    out["wound_rim"].append(clamp(_blob(rng, wx, wz, R * 0.17, n=16, wobble=0.5)))
-    out["wound_flesh"].append(clamp(_blob(rng, wx, wz, R * 0.11, n=14, wobble=0.45)))
+    wx, wz = -bruise_side * R * 0.70, R * 0.30            # torn-open temple on the other side
+    out["wound_rim"].append(clamp(_blob(rng, wx, wz, R * 0.15, n=16, wobble=0.5)))
+    out["wound_flesh"].append(clamp(_blob(rng, wx, wz, R * 0.09, n=14, wobble=0.45)))
     tilt = rng.uniform(-0.25, 0.25)                       # stitched scar across the forehead
     cx, cz = bruise_side * R * 0.1, R * 0.64
     half = R * 0.28
@@ -1440,7 +1524,10 @@ def _clip_talk(P, size, p):
 
 
 def _clip_brow_raise(P, size, p):
-    nodes = [P["brows"]] if "brows" in P else [P[k] for k in ("brow_left", "brow_right") if k in P]
+    if p.get("targets"):                         # e.g. a single raised brow
+        nodes = [P[k] for k in p["targets"] if k in P]
+    else:
+        nodes = [P["brows"]] if "brows" in P else [P[k] for k in ("brow_left", "brow_right") if k in P]
     lift = p.get("lift", 0.06 * size)
     return [_track(n, "location", 2, [(0, 0), (4, lift), (12, lift), (16, 0)]) for n in nodes], 16
 
@@ -1469,7 +1556,7 @@ def _clip_pulse(P, size, p):
 
 
 def _clip_tear_drip(P, size, p):
-    tears = [P[k] for k in ("tear_left", "tear_right") if k in P]
+    tears = [n for k, n in P.items() if k.startswith("tear_") and k != "tear_pool"]
     out = [_track(n, "scale", 2, [(0, 1), (12, p.get("stretch", 1.4)), (24, 1)]) for n in tears]
     if "tear_pool" in P:
         out.append(_track(P["tear_pool"], "scale", 0, [(0, 1), (12, 1.06), (24, 1)]))
@@ -1509,9 +1596,7 @@ def _head_and_feature_nodes(P):
 
 def _clip_look_around(P, size, p):
     """Eyes lead, then the head turns (features slide further than the skull: parallax) and tilts a touch."""
-    gaze = _gaze_nodes(P)
-    if not gaze:
-        return [], 72
+    gaze = _gaze_nodes(P)                        # faces with no visible eyes (sunglasses) still turn
     f, h = p.get("turn", 0.045 * size), p.get("head", 0.018 * size)
     tilt = p.get("tilt", 0.07)
     t = (0, 8, 16, 30, 40, 48, 56, 66, 72)
@@ -1546,6 +1631,77 @@ def _clip_eye_dart(P, size, p):
 def _clip_tilt(P, size, p):
     a = p.get("angle", 0.09)
     return [_track(P["root"], "rotation_euler", 1, [(0, 0), (10, a), (20, 0), (30, -a), (40, 0)])], 40
+
+
+def _clip_zzz(P, size, p):
+    """The snore Zs bob up and down one after another."""
+    up = p.get("lift", 0.07 * size)
+    out = []
+    for i, k in enumerate(("zzz_1", "zzz_2", "zzz_3")):
+        if k not in P:
+            continue
+        s0 = i * 6
+        out.append(_track(P[k], "location", 2, [(0, 0), (s0, 0), (s0 + 10, up), (s0 + 20, 0), (36, 0)]))
+        out.append(_track(P[k], "scale", 0, [(0, 1), (s0, 1), (s0 + 10, 1.25), (s0 + 20, 1), (36, 1)]))
+        out.append(_track(P[k], "scale", 2, [(0, 1), (s0, 1), (s0 + 10, 1.25), (s0 + 20, 1), (36, 1)]))
+    return out, 36
+
+
+def _clip_eye_spin(P, size, p):
+    """Dizzy: the crossed-out eyes spin a full turn."""
+    return [_track(P[k], "rotation_euler", 1, [(0, 0), (24, 2 * math.pi)])
+            for k in ("eye_left", "eye_right") if k in P], 24
+
+
+def _clip_chin_tap(P, size, p):
+    if "hand" not in P:
+        return [], 20
+    a = p.get("angle", 0.12)
+    return [_track(P["hand"], "rotation_euler", 1, [(0, 0), (4, a), (8, 0), (12, a), (16, 0), (20, 0)])], 20
+
+
+def _clip_heartbeat(P, size, p):
+    amt = p.get("amount", 0.25)
+    out = []
+    for i, k in enumerate(("heart_1", "heart_2", "heart_3")):
+        if k not in P:
+            continue
+        s0 = i * 3
+        keys = [(0, 1), (s0, 1), (s0 + 3, 1 + amt), (s0 + 6, 1), (s0 + 9, 1 + amt * 0.7), (s0 + 12, 1), (24, 1)]
+        out += [_track(P[k], "scale", 0, keys), _track(P[k], "scale", 2, keys)]
+    return out, 24
+
+
+def _clip_shush(P, size, p):
+    if "hand" not in P:
+        return [], 24
+    a = p.get("angle", 0.06)
+    return [_track(P["hand"], "rotation_euler", 1, [(0, 0), (6, a), (12, -a), (18, a), (24, 0)]),
+            _track(P["hand"], "location", 2, [(0, 0), (12, 0.015 * size), (24, 0)])], 24
+
+
+def _clip_puff(P, size, p):
+    amt = p.get("amount", 0.2)
+    out = []
+    for k, ph in (("cheek_left", 0), ("cheek_right", 8)):          # the cheeks swell out of step
+        if k in P:
+            keys = [(0, 1), (ph, 1), (ph + 8, 1 + amt), (ph + 16, 1), (32, 1)]
+            out += [_track(P[k], "scale", 0, keys), _track(P[k], "scale", 2, keys)]
+    return out, 32
+
+
+def _clip_yawn(P, size, p):
+    if "mouth" not in P:
+        return [], 36
+    big = p.get("open", 1.25)
+    keys = [(0, 1), (10, big), (26, big), (36, 1)]
+    out = [_track(P["mouth"], "scale", 0, keys), _track(P["mouth"], "scale", 2, keys)]
+    for k in ("eye_left", "eye_right"):                              # the eyes squeeze shut
+        if k in P:
+            out.append(_track(P[k], "scale", 2, [(0, 1), (10, 0.45), (26, 0.45), (36, 1)]))
+    if "hand" in P:
+        out.append(_track(P["hand"], "location", 2, [(0, 0), (10, 0.03 * size), (26, 0.03 * size), (36, 0)]))
+    return out, 36
 
 
 def _clip_chatter(P, size, p):
@@ -1635,7 +1791,9 @@ CLIPS = {"blink": _clip_blink, "talk": _clip_talk, "brow_raise": _clip_brow_rais
          "tongue_wag": _clip_tongue_wag, "crazy_eyes": _clip_crazy_eyes, "shimmer": _clip_shimmer,
          "quiver": _clip_quiver, "tear_well": _clip_tear_well, "explode": _clip_explode,
          "shake": _clip_shake, "rattle": _clip_rattle, "look_around": _clip_look_around,
-         "eye_dart": _clip_eye_dart, "tilt": _clip_tilt}
+         "eye_dart": _clip_eye_dart, "tilt": _clip_tilt, "zzz": _clip_zzz, "eye_spin": _clip_eye_spin,
+         "chin_tap": _clip_chin_tap, "heartbeat": _clip_heartbeat, "shush": _clip_shush,
+         "puff": _clip_puff, "yawn": _clip_yawn}
 
 
 def build_clips(spec: FaceSpec, nodes, size: float):
@@ -1744,7 +1902,8 @@ def build_model(code: str, name: str, svg_path: Path, size: float, curve_segment
         "title": spec.title,
         "supported": supported,
         "is_face": bool(summary["is_face"]) or supported,
-        "complete": {"eye_left", "eye_right"} <= labels and bool(labels & {"mouth", "mask", "nose"}),   # a mask/skull has no visible mouth
+        "complete": ({"eye_left", "eye_right"} <= labels or "glasses" in labels)
+                    and (bool(labels & {"mouth", "mask", "nose"}) or spec.mouthless),   # a mask/skull has no visible mouth
         "note": "left/right are screen-side (as seen by the viewer), not the character's own left/right",
         "root": name,
         "parts": facemap_parts,
@@ -1854,13 +2013,14 @@ def render_frame(model: dict, world: dict, px: int, bg: Tuple[int, int, int], su
     return img.resize((px, px), Image.LANCZOS) if supersample > 1 else img
 
 
-def write_gif(model: dict, path: Path, px: int = 320, fps: int = 24, bg: str = "#ffffff") -> int:
+def write_gif(model: dict, path: Path, px: int = 320, fps: int = 8, bg: str = "#ffffff") -> int:
     """Write the whole timeline as a looping GIF. Returns the number of frames."""
     curves = _curves(model)
     last = max([c["end"] for c in model["clips"]] + [1])
+    step = max(1, round(model.get("fps", FPS) / fps))     # the timeline runs at 24 fps: sample it
     frames = [render_frame(model, evaluate_pose(model, f, curves), px, hex_rgb(bg))
               .convert("P", palette=1, colors=128)       # 1 == Image.ADAPTIVE
-              for f in range(1, last + 1)]
+              for f in range(1, last + 1, step)]
     frames[0].save(path, save_all=True, append_images=frames[1:], duration=round(1000 / fps), loop=0,
                    disposal=2)
     return len(frames)
@@ -2206,7 +2366,7 @@ def host_main(argv: Optional[List[str]] = None) -> int:
                     help="also write <name>.gif, a preview of every animation clip played in a row "
                          "(needs Pillow, no Blender)")
     ap.add_argument("--gif-size", type=int, default=320, help="GIF width/height in pixels (default: 320)")
-    ap.add_argument("--gif-fps", type=int, default=24, help="GIF frame rate (default: 24)")
+    ap.add_argument("--gif-fps", type=int, default=8, help="GIF frame rate (default: 8; the timeline runs at 24 fps and is sampled)")
     ap.add_argument("--gif-background", default="#ffffff", help="GIF background colour (default: #ffffff)")
     ap.add_argument("--debug-svg", action="store_true", help="also write <name>.facemap.svg showing the labelled shapes")
     ap.add_argument("--verbose", action="store_true", help="show all Blender output")
