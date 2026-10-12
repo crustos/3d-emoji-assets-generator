@@ -133,7 +133,7 @@ python3 blender.py --list-faces
 python3 blender.py --emojis zany_face --gif --facemap-only   # GIF preview (needs Pillow)
 ```
 
-![Zombie zany face animated: crazy eyes, blink, talk, tongue wag, look left and right, head tilt](docs/demo/zany_face.gif)
+![Zombie zany face animated: crazy eyes, blink, talk, tongue wag, look left and right, head tilt](zany_face.gif)
 
 *Preview GIF of 🤪 generated with `--gif`: the generated zombie head with the Twemoji face parts animating on top.*
 
