@@ -128,14 +128,14 @@ npm run generate -- --shape coin --emojis astronaut --format glb --merge-materia
 `blender.py` exports emoji straight from the SVGs to Blender **Grease Pencil** (`.blend`), one object per face part (eyes, mouth, brows, …) with ready-made animation clips and a generated zombie head (`--skin none` to disable), for a curated list of face emoji. Needs Blender 4.3+; no dev server required.
 
 ```bash
-python3 blender.py --emojis rolling_eyes,joy --output ./output/blender/
+python3 blender.py --emojis zany_face,joy --output ./output/blender/
 python3 blender.py --list-faces
-python3 blender.py --emojis rolling_eyes --gif --facemap-only   # GIF preview (needs Pillow)
+python3 blender.py --emojis zany_face --gif --facemap-only   # GIF preview (needs Pillow)
 ```
 
-![Zombie rolling-eyes face animated: eye roll, blink, talk, look left and right, head tilt](docs/demo/rolling_eyes.gif)
+![Zombie zany face animated: crazy eyes, blink, talk, tongue wag, look left and right, head tilt](docs/demo/zany_face.gif)
 
-*Preview GIF of 🙄 generated with `--gif`: the generated zombie head with the Twemoji face parts animating on top.*
+*Preview GIF of 🤪 generated with `--gif`: the generated zombie head with the Twemoji face parts animating on top.*
 
 See **[docs/blender-export.md](docs/blender-export.md)** for details.
 
